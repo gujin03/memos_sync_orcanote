@@ -13,6 +13,14 @@ const zhCN: Record<string, string> = {
   "Notes before this date won't be synced, even in full sync mode.":
     "该日期之前的笔记将不会被同步，即使在全量同步模式下也是如此。",
 
+  // Visibility filter
+  "Visibility filter": "可见性过滤",
+  "Select which visibility levels to sync. Unchecked items will be excluded.":
+    "选择要同步的可见性级别，未勾选的类型将被排除。",
+  "PRIVATE": "私有",
+  "PROTECTED": "工作区",
+  "PUBLIC": "公开",
+
   // Actions
   "Incremental sync": "增量同步",
   "Full sync": "全量同步",

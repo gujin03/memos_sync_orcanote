@@ -13,6 +13,14 @@ const en: Record<string, string> = {
   "Notes before this date won't be synced, even in full sync mode.":
     "Notes before this date won't be synced, even in full sync mode.",
 
+  // Visibility filter
+  "Visibility filter": "Visibility filter",
+  "Select which visibility levels to sync. Unchecked items will be excluded.":
+    "Select which visibility levels to sync. Unchecked items will be excluded.",
+  "PRIVATE": "Private",
+  "PROTECTED": "Protected (Workspace)",
+  "PUBLIC": "Public",
+
   // Actions
   "Incremental sync": "Incremental sync",
   "Full sync": "Full sync",

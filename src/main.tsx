@@ -61,6 +61,19 @@ export async function load(_name: string) {
       type: "date",
       defaultValue: null,
     },
+    visibilityFilter: {
+      label: t("Visibility filter"),
+      description: t(
+        "Select which visibility levels to sync. Unchecked items will be excluded.",
+      ),
+      type: "multiChoices",
+      defaultValue: ["PRIVATE", "PROTECTED", "PUBLIC"],
+      choices: [
+        { label: t("PRIVATE"), value: "PRIVATE" },
+        { label: t("PROTECTED"), value: "PROTECTED" },
+        { label: t("PUBLIC"), value: "PUBLIC" },
+      ],
+    },
   })
 
   orca.themes.injectCSS(
@@ -132,6 +145,11 @@ async function syncMemos(fullSync: boolean) {
   const inboxName = settings.inboxName || "Memos Inbox"
   const noteTag = settings.noteTag || "Memos Note"
   const startDateValue = settings.startDate
+  const visibilityFilter: string[] = settings.visibilityFilter ?? [
+    "PRIVATE",
+    "PROTECTED",
+    "PUBLIC",
+  ]
 
   if (!memosApiUrl || !memosApiToken) {
     orca.notify("warn", t("Please configure memos API URL and token first."))
@@ -152,6 +170,7 @@ async function syncMemos(fullSync: boolean) {
       memosApiToken,
       lastSyncTime,
       startDateValue,
+      visibilityFilter,
     )
 
     if (!memos?.length) {
@@ -193,13 +212,14 @@ async function fetchMemos(
   token: string,
   lastSyncTime: number | null,
   startDate: string | null,
+  visibilityFilter: string[],
 ): Promise<MemosMemo[]> {
   const baseUrl = apiUrl.replace(/\/$/, "")
   const url = new URL(`${baseUrl}/api/v1/memos`)
   url.searchParams.set("page_size", "100")
   url.searchParams.set("order_by", "create_time desc")
 
-  // Build server-side filter (CEL syntax — Memos uses Unix second timestamps)
+  // Build server-side filter (CEL syntax — Memos uses Unix second timestamps for dates)
   // created_ts and updated_ts map to the DB's Unix timestamp columns.
   // The returned memo.createTime is still an ISO 8601 string — no conflict.
   const filters: string[] = []
@@ -210,6 +230,13 @@ async function fetchMemos(
   if (lastSyncTime) {
     const lastSyncTs = Math.floor(lastSyncTime / 1000)
     filters.push(`updated_ts >= ${lastSyncTs}`)
+  }
+  if (
+    visibilityFilter?.length > 0 &&
+    visibilityFilter.length < 3
+  ) {
+    const visList = visibilityFilter.map((v) => `"${v}"`).join(", ")
+    filters.push(`visibility in [${visList}]`)
   }
   if (filters.length > 0) {
     url.searchParams.set("filter", filters.join(" && "))
