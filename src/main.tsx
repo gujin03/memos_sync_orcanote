@@ -174,7 +174,7 @@ async function syncMemos(fullSync: boolean) {
         const inbox = await ensureInbox(journal, inboxName)
 
         for (const memo of memosInDate) {
-          await syncMemo(memo, inbox, noteTag)
+          await syncMemo(memo, inbox, noteTag, memosApiUrl)
         }
       }
     })
@@ -268,6 +268,7 @@ async function syncMemo(
   memo: MemosMemo,
   inbox: Block,
   noteTag: string,
+  memosApiUrl: string,
 ) {
   const memoId = memo.name.replace("memos/", "")
 
@@ -364,6 +365,10 @@ async function syncMemo(
     const tagPattern = new RegExp(`#(?:${escapedTags.join("|")})\\s*`, "g")
     cleanContent = cleanContent.replace(tagPattern, "").trim()
   }
+
+  // Prepend URL link to memo content for quick access back to Memos
+  const memoUrl = `${memosApiUrl.replace(/\/$/, "")}/memos/${memoId}`
+  cleanContent = `<p>🔗 <a href="${memoUrl}">Open in Memos</a></p>` + cleanContent
 
   await orca.commands.invokeEditorCommand(
     "core.editor.batchInsertHTML",
