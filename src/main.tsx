@@ -351,11 +351,22 @@ async function syncMemo(
     }
   }
 
+  // Strip tag hashtags from content to avoid duplication
+  // (tags are already inserted as tag blocks above)
+  let cleanContent = memo.content
+  if (memo.tags?.length) {
+    const escapedTags = memo.tags.map((tag) =>
+      tag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
+    )
+    const tagPattern = new RegExp(`#(?:${escapedTags.join("|")})\\s*`, "g")
+    cleanContent = cleanContent.replace(tagPattern, "").trim()
+  }
+
   await orca.commands.invokeEditorCommand(
     "core.editor.batchInsertHTML",
     null,
     noteBlock,
     "firstChild",
-    memo.content,
+    cleanContent,
   )
 }
