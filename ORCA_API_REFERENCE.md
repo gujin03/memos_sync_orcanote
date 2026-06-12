@@ -472,3 +472,105 @@ export async function unload(pluginName: string) {
   orca.themes.removeCSSResources(pluginName)
 }
 ```
+
+---
+
+## 18. MCP 协议层（外部程序调用 Orca Note）
+
+Orca Note 在本地运行了一个 **MCP（Model Context Protocol）服务**，允许外部程序通过 HTTP 与 Orca Note 交互。
+
+### 连接信息
+
+| 属性 | 值 |
+|------|----|
+| 端点 | `http://localhost:18672/mcp` |
+| 传输模式 | Streamable HTTP（非 SSE） |
+| 认证 | Bearer Token |
+| 请求头 | `Authorization: Bearer <token>` |
+| | `Content-Type: application/json` |
+| | `Accept: application/json` |
+
+### 可用 MCP 工具
+
+| 工具 | 功能 | 对应插件内部 API |
+|------|------|----------------|
+| `query_blocks` | 结构化搜索块（文本/标签/日期/任务组合条件） | `orca.invokeBackend("query", ...)` |
+| `get_blocks_text` | 获取块及其后代的纯文本内容 | `orca.state.blocks[id].text` |
+| `get_tags_and_pages` | 分页列举所有标签和页面 | 无直接对应 |
+| `get_journal` | 获取或创建指定日期的日记块 | `orca.invokeBackend("get-journal-block", ...)` |
+| `get_page` | 根据块 ID 定位所属页面 | 无直接对应 |
+| `insert_markdown` | 在指定位置插入 Markdown 内容 | `invokeEditorCommand("core.editor.batchInsertHTML", ...)` |
+| `insert_tags` | 为块附加标签（含属性值） | `invokeEditorCommand("core.editor.insertTag", ...)` |
+| `create_tags` | 创建标签定义 | 无直接对应 |
+| `create_page` | 创建新页面 | 无直接对应 |
+| `remove_tags` | 移除块上的标签 | `invokeEditorCommand("core.editor.setProperties", _tags=[])` |
+| `move_blocks` | 将块移到新的父块下 | `invokeEditorCommand("core.editor.moveBlock", ...)` |
+| `delete_blocks` | 按 ID 删除块 | `invokeEditorCommand("core.editor.deleteBlocks", ...)` |
+| `parse_datetime` | 解析自然语言日期时间 | 无直接对应 |
+
+### MCP 调用示例
+
+```sh
+# 列举所有标签和页面
+curl -X POST http://localhost:18672/mcp \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "tools/call",
+    "params": {
+      "name": "get_tags_and_pages",
+      "arguments": { "repoId": "my-repo" }
+    }
+  }'
+
+# 插入 Markdown 到指定块下
+curl -X POST http://localhost:18672/mcp \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 2,
+    "method": "tools/call",
+    "params": {
+      "name": "insert_markdown",
+      "arguments": {
+        "repoId": "my-repo",
+        "parentBlockId": 12345,
+        "position": "firstChild",
+        "markdown": "# Hello\n This is **bold** text."
+      }
+    }
+  }'
+```
+
+### 与插件内部 API 的关系
+
+```
+┌────────────────────────────────────────────┐
+│                Orca Note App                │
+│                                            │
+│  ┌──────────────────────────────────┐      │
+│  │ 插件系统 (orca 全局 API)          │      │
+│  │ ▸ 插件内部直接调用 orca.xxx      │      │
+│  │ ▸ 有完整访问权限                 │      │
+│  └──────────────────────────────────┘      │
+│                                            │
+│  ┌──────────────────────────────────┐      │
+│  │ MCP 服务 (:18672/mcp)            │      │
+│  │ ▸ 外部程序通过 HTTP 调用          │      │
+│  │ ▸ 功能子集（常见 CRUD 操作）      │      │
+│  │ ▸ 需 Token 认证                  │      │
+│  └──────────────────────────────────┘      │
+└────────────────────────────────────────────┘
+```
+
+### 适用场景对比
+
+| 场景 | 推荐方式 | 原因 |
+|------|---------|------|
+| 开发 Orca Note 插件 | `orca` 全局 API | 完整权限、无需 HTTP 开销、实时响应式状态 |
+| 外部脚本/CLI 工具操作 | MCP 协议 | 无需在 Orca Note 内运行，语言无关 |
+| 自动化工作流（cron/she'11） | MCP 协议 | 可脱离 Orca Note 界面独立执行 |
+| 批量数据导入导出 | MCP 协议 | 适合外部 ETL 流程 |

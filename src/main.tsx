@@ -199,6 +199,22 @@ async function fetchMemos(
   url.searchParams.set("page_size", "100")
   url.searchParams.set("order_by", "create_time desc")
 
+  // Build server-side filter (CEL syntax — Memos uses Unix second timestamps)
+  // created_ts and updated_ts map to the DB's Unix timestamp columns.
+  // The returned memo.createTime is still an ISO 8601 string — no conflict.
+  const filters: string[] = []
+  if (startDate) {
+    const startTs = Math.floor(new Date(startDate).getTime() / 1000)
+    filters.push(`created_ts >= ${startTs}`)
+  }
+  if (lastSyncTime) {
+    const lastSyncTs = Math.floor(lastSyncTime / 1000)
+    filters.push(`updated_ts >= ${lastSyncTs}`)
+  }
+  if (filters.length > 0) {
+    url.searchParams.set("filter", filters.join(" && "))
+  }
+
   const allMemos: MemosMemo[] = []
   let pageToken: string | undefined
 
@@ -216,25 +232,7 @@ async function fetchMemos(
     pageToken = data.nextPageToken
   } while (pageToken)
 
-  // Client-side filtering
-  let filteredMemos = allMemos
-
-  // Filter by startDate
-  if (startDate) {
-    const startDateMs = new Date(startDate).getTime()
-    filteredMemos = filteredMemos.filter(
-      (m) => new Date(m.createTime).getTime() >= startDateMs,
-    )
-  }
-
-  // Filter by lastSyncTime (only for incremental sync)
-  if (lastSyncTime) {
-    filteredMemos = filteredMemos.filter(
-      (m) => new Date(m.updateTime).getTime() >= lastSyncTime,
-    )
-  }
-
-  return filteredMemos
+  return allMemos
 }
 
 function xhrRequest(url: string, token: string): Promise<any> {
