@@ -63,7 +63,10 @@ export async function load(_name: string) {
     },
   })
 
-  orca.themes.injectCSSResource(`${pluginName}/dist/main.css`, pluginName)
+  orca.themes.injectCSS(
+    `.memos-button { width: 20px; height: 20px; object-fit: contain; }`,
+    pluginName,
+  )
 
   if (orca.state.commands["memos.sync"] == null) {
     orca.commands.registerCommand(
@@ -113,7 +116,7 @@ export async function load(_name: string) {
 export async function unload() {
   orca.headbar.unregisterHeadbarButton("memos.sync")
   orca.commands.unregisterCommand("memos.sync")
-  orca.themes.removeCSSResources(pluginName)
+  orca.themes.removeCSS(pluginName)
 
   console.log(`${pluginName} unloaded.`)
 }
