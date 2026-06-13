@@ -1,0 +1,62 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'   # 推送 v1.0.0、v1.0.1 等版本标签时触发
+
+jobs:
+  build:
+    name: Build and Package
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 8
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build plugin
+        run: NODE_ENV=production pnpm build
+
+      - name: Package plugin
+        run: |
+          mkdir -p release
+          cp -r dist/ icon.png LICENSE README.md package.json release/
+          cd release
+          zip -r ../orca-memos-sync.zip ./*
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: orca-memos-sync.zip
+          name: Memos Sync ${{ github.ref_name }}
+          body: |
+            ## Memos Sync ${{ github.ref_name }}
+
+            ### 安装方式
+
+            1. 下载 `orca-memos-sync.zip`
+            2. 解压到 Orca Note 的 `plugins` 目录
+               - macOS: `~/Documents/orca/plugins/orca-memos-sync/`
+               - Windows: `C:\Users\<用户名>\Documents\orca\plugins\orca-memos-sync\`
+            3. 重启 Orca Note，在设置中启用插件
+            4. 配置 Memos API 地址和 Token
+
+            ### 使用说明
+
+            点击顶栏的 🐋 按钮进行同步：
+            - **左键点击**: 增量同步
+            - **悬停 → 全量同步**: 同步所有笔记
+
+            详细说明请查看 [README](https://github.com/${{ github.repository }})

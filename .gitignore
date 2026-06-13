@@ -3,3 +3,7 @@ dist/
 *.zip
 .DS_Store
 .workbuddy/
+# Workspace-specific research docs
+FLOWCHART.md
+ORCA_API_REFERENCE.md
+LOGSEQ_SYNC_PLAN.md
