@@ -1,4 +1,6 @@
-# Memos Sync — Orca Note Plugin
+# Memos Sync — Orca Note Plugin 🐋➡️📓
+
+> 🙏 非常感谢 [虎鲸笔记 / Orca Note](https://github.com/sethyuan/orca-note) 的作者 [Seth](https://github.com/sethyuan) 开发了功能如此强大的知识管理软件。本插件是在其开源插件 [orca-flomo-sync](https://github.com/sethyuan/orca-flomo-sync) 的基础上 **vibe coding** 而成。为同时使用 [Memos](https://usememos.com/) 和 Orca Note 两款开源软件的同学，解决无法数据同步的难题。再次感谢 Seth！❤️
 
 将 [Memos](https://usememos.com/) 笔记同步到 [Orca Note](https://github.com/sethyuan/orca-note) 日记中的插件。
 
