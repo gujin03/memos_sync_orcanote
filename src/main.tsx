@@ -183,20 +183,18 @@ async function syncMemos(fullSync: boolean) {
       memos,
     )
 
-    await orca.commands.invokeGroup(async () => {
-      for (const [date, memosInDate] of memosByDate.entries()) {
-        const journal: Block = await orca.invokeBackend(
-          "get-journal-block",
-          new Date(date),
-        )
-        if (journal == null) continue
-        const inbox = await ensureInbox(journal, inboxName)
+    for (const [date, memosInDate] of memosByDate.entries()) {
+      const journal: Block = await orca.invokeBackend(
+        "get-journal-block",
+        new Date(date),
+      )
+      if (journal == null) continue
+      const inbox = await ensureInbox(journal, inboxName)
 
-        for (const memo of memosInDate) {
-          await syncMemo(memo, inbox, noteTag, memosApiUrl)
-        }
+      for (const memo of memosInDate) {
+        await syncMemo(memo, inbox, noteTag, memosApiUrl)
       }
-    })
+    }
 
     await orca.plugins.setData(pluginName, "lastSyncTime", Date.now())
 
@@ -295,114 +293,114 @@ async function syncMemo(
   noteTag: string,
   memosApiUrl: string,
 ) {
-  const memoId = memo.name.replace("memos/", "")
+  try {
+    const memoId = memo.name.replace("memos/", "")
 
-  // 1. 查重：按 #Memos Note 标签的 ID 属性查找
-  const resultIds = (await orca.invokeBackend("query", {
-    q: {
-      kind: 1,
-      conditions: [
-        {
-          kind: 4,
-          name: noteTag,
-          properties: [{ name: "ID", op: 1, value: memoId }],
-        },
-      ],
-    },
-    pageSize: 1,
-  } as QueryDescription)) as DbId[]
+    // 1. 查重：按 #Memos Note 标签的 ID 属性查找
+    const resultIds = (await orca.invokeBackend("query", {
+      q: {
+        kind: 1,
+        conditions: [
+          {
+            kind: 4,
+            name: noteTag,
+            properties: [{ name: "ID", op: 1, value: memoId }],
+          },
+        ],
+      },
+      pageSize: 1,
+    } as QueryDescription)) as DbId[]
 
-  // 已有块：删除整个旧结构（不兼容新规则），下方重建
-  if (resultIds.length > 0) {
-    const oldBlockId = resultIds[0]
-    await orca.commands.invokeEditorCommand("core.editor.deleteBlocks", null, [oldBlockId])
-  }
-
-  // 2. 准备内容：去标签文本
-  let cleanContent = memo.content
-  if (memo.tags?.length) {
-    const escapedTags = memo.tags.map((tag) =>
-      tag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
-    )
-    const tagPattern = new RegExp(`#(?:${escapedTags.join("|")})\\s*`, "g")
-    cleanContent = cleanContent.replace(tagPattern, "").trim()
-  }
-
-  // 提取标题（第2层用）：第一行/首句，最多100字符
-  const paragraphs = cleanContent.split("\n").filter((p) => p.trim())
-  const titleText = (paragraphs[0] || memoId).substring(0, 100)
-  const bodyParas = paragraphs.slice(1).filter((p) => p.trim())
-
-  // ===== 第1层：根块 =====
-  const rootId = await orca.commands.invokeEditorCommand(
-    "core.editor.insertBlock",
-    null,
-    inbox,
-    "lastChild",
-    [{ t: "t", v: `${memoId} #Memos Note` }],
-    { type: "text" },
-    new Date(memo.createTime),
-    new Date(memo.updateTime),
-  )
-  let noteBlock = orca.state.blocks[rootId] ?? null
-  if (!noteBlock) return
-
-  // 根块标签：仅 #Memos Note，ID 存于标签属性
-  await orca.commands.invokeEditorCommand(
-    "core.editor.insertTag",
-    null,
-    rootId,
-    noteTag,
-    [{ name: "ID", type: 1, value: memoId }],
-  )
-
-  // ===== 第2层：标题块（含核心标签） =====
-  const titleId = await orca.commands.invokeEditorCommand(
-    "core.editor.insertBlock",
-    null,
-    noteBlock,
-    "lastChild",
-    [{ t: "t", v: titleText }],
-  )
-  if (!titleId) return
-
-  // Memos 原始标签打在标题块上
-  if (memo.tags?.length) {
-    for (const tag of memo.tags) {
-      await orca.commands.invokeEditorCommand(
-        "core.editor.insertTag",
-        null,
-        titleId,
-        tag,
-      )
+    // 已有块：删除后重建（旧结构不兼容新规则）
+    if (resultIds.length > 0) {
+      await orca.commands.invokeEditorCommand("core.editor.deleteBlocks", null, [resultIds[0]])
     }
-  }
 
-  // ===== 第3层：内容块（标题块的子块） =====
-  if (bodyParas.length > 0) {
-    const titleBlock = orca.state.blocks[titleId]
-    if (titleBlock) {
-      let prevContentId: DbId | null = null
-      for (const para of bodyParas) {
-        const paraId = await orca.commands.invokeEditorCommand(
-          "core.editor.insertBlock",
+    // 2. 准备内容：去标签文本
+    let cleanContent = memo.content
+    if (memo.tags?.length) {
+      const escapedTags = memo.tags.map((tag) =>
+        tag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
+      )
+      const tagPattern = new RegExp(`#(?:${escapedTags.join("|")})\\s*`, "g")
+      cleanContent = cleanContent.replace(tagPattern, "").trim()
+    }
+
+    // 提取标题（第2层用）：第一行/首句，最多100字符
+    const paragraphs = cleanContent.split("\n").filter((p) => p.trim())
+    const titleText = (paragraphs[0] || memoId).substring(0, 100)
+    const bodyParas = paragraphs.slice(1).filter((p) => p.trim())
+
+    // ===== 第1层：根块（纯 ID 文本，不含 # 以免被 Orca 当作标签引用解析） =====
+    const rootId = await orca.commands.invokeEditorCommand(
+      "core.editor.insertBlock", null as any, inbox, "lastChild",
+      [{ t: "t", v: memoId }],
+    )
+    let noteBlock = orca.state.blocks[rootId] ?? null
+    if (!noteBlock) return
+
+    // 根块标签：仅 #Memos Note，ID 存于标签属性
+    await orca.commands.invokeEditorCommand(
+      "core.editor.insertTag",
+      null,
+      rootId,
+      noteTag,
+      [{ name: "ID", type: 1, value: memoId }],
+    )
+
+    // ===== 第2层：标题块（含核心标签） =====
+    const titleId = await orca.commands.invokeEditorCommand(
+      "core.editor.insertBlock",
+      null,
+      noteBlock,
+      "lastChild",
+      [{ t: "t", v: titleText }],
+    )
+    if (!titleId) return
+
+    // Memos 原始标签打在标题块上
+    if (memo.tags?.length) {
+      for (const tag of memo.tags) {
+        await orca.commands.invokeEditorCommand(
+          "core.editor.insertTag",
           null,
-          prevContentId ? orca.state.blocks[prevContentId] : titleBlock,
-          prevContentId ? "after" : "firstChild",
-          [{ t: "t", v: para.trim() }],
+          titleId,
+          tag,
         )
-        if (paraId) prevContentId = paraId
       }
     }
-  }
 
-  // ===== 第4层：链接块（最后，溯源用） =====
-  const memoUrl = `${memosApiUrl.replace(/\/$/, "")}/m/${memoId}`
-  await orca.commands.invokeEditorCommand(
-    "core.editor.insertBlock",
-    null,
-    noteBlock,
-    "lastChild",
-    [{ t: "t", v: `🔗 Open in Memos：${memoUrl}` }],
-  )
+    // ===== 第3层：内容块（标题块的子块） =====
+    if (bodyParas.length > 0) {
+      const titleBlock = orca.state.blocks[titleId]
+      if (titleBlock) {
+        let prevContentId: DbId | null = null
+        for (const para of bodyParas) {
+          const paraId = await orca.commands.invokeEditorCommand(
+            "core.editor.insertBlock",
+            null,
+            prevContentId ? orca.state.blocks[prevContentId] : titleBlock,
+            prevContentId ? "after" : "firstChild",
+            [{ t: "t", v: para.trim() }],
+          )
+          if (paraId) prevContentId = paraId
+        }
+      }
+    }
+
+    // ===== 第4层：链接块（最后，溯源用） =====
+    // 重新获取根块（title 插入后 children 已变，旧引用 stale）
+    noteBlock = orca.state.blocks[rootId] ?? noteBlock
+    const memoUrl = `${memosApiUrl.replace(/\/$/, "")}/m/${memoId}`
+    await orca.commands.invokeEditorCommand(
+      "core.editor.insertBlock",
+      null,
+      noteBlock,
+      "lastChild",
+      // t:"l" = 内联链接片段，v=显示文本，l=跳转URL
+      [{ t: "l", v: "🔗 Open in Memos", l: memoUrl }],
+    )
+  } catch (e) {
+    console.error("MEMOS SYNC: syncMemo error for", memo.name, e)
+  }
 }
