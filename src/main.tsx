@@ -183,6 +183,26 @@ async function syncMemos(fullSync: boolean) {
       memos,
     )
 
+    const totalMemos = memos.length
+    let syncedCount = 0
+
+    // 全量同步时：一次性清除所有旧结构，再重建
+    if (fullSync) {
+      orca.notify("info", t("Cleaning up old data before full sync..."))
+      const allExisting = (await orca.invokeBackend("query", {
+        q: { kind: 1, conditions: [{ kind: 4, name: noteTag }] },
+        pageSize: 100000,
+      } as QueryDescription)) as DbId[]
+      if (allExisting?.length) {
+        // 分批删除（避免单次操作过大）
+        for (let i = 0; i < allExisting.length; i += 100) {
+          await orca.commands.invokeEditorCommand(
+            "core.editor.deleteBlocks", null, allExisting.slice(i, i + 100),
+          )
+        }
+      }
+    }
+
     for (const [date, memosInDate] of memosByDate.entries()) {
       const journal: Block = await orca.invokeBackend(
         "get-journal-block",
@@ -193,6 +213,11 @@ async function syncMemos(fullSync: boolean) {
 
       for (const memo of memosInDate) {
         await syncMemo(memo, inbox, noteTag, memosApiUrl)
+        syncedCount++
+        // 每 20 条通知一次进度
+        if (syncedCount % 20 === 0 || syncedCount === totalMemos) {
+          orca.notify("info", t(`Syncing... ${syncedCount}/${totalMemos}`))
+        }
       }
     }
 
@@ -311,9 +336,9 @@ async function syncMemo(
       pageSize: 1,
     } as QueryDescription)) as DbId[]
 
-    // 已有块：删除后重建（旧结构不兼容新规则）
+    // 查重：已有块跳过（已在全量同步开始阶段一次性清除）
     if (resultIds.length > 0) {
-      await orca.commands.invokeEditorCommand("core.editor.deleteBlocks", null, [resultIds[0]])
+      return
     }
 
     // 2. 准备内容：去标签文本
