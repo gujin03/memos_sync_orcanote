@@ -186,21 +186,37 @@ async function syncMemos(fullSync: boolean) {
     const totalMemos = memos.length
     let syncedCount = 0
 
-    // 全量同步时：一次性清除所有旧结构，再重建
-    if (fullSync) {
-      orca.notify("info", t("Cleaning up old data before full sync..."))
-      const allExisting = (await orca.invokeBackend("query", {
-        q: { kind: 1, conditions: [{ kind: 4, name: noteTag }] },
-        pageSize: 100000,
-      } as QueryDescription)) as DbId[]
-      if (allExisting?.length) {
-        // 分批删除（避免单次操作过大）
-        for (let i = 0; i < allExisting.length; i += 100) {
-          await orca.commands.invokeEditorCommand(
-            "core.editor.deleteBlocks", null, allExisting.slice(i, i + 100),
-          )
+    // 批量查询已存在的 Memos Note 块，构建 ID 查找表（替代逐条 N+1 查询）
+    const allExisting = (await orca.invokeBackend("query", {
+      q: { kind: 1, conditions: [{ kind: 4, name: noteTag }] },
+      pageSize: 100000,
+    } as QueryDescription)) as DbId[]
+    const existingBlocks = new Map<string, DbId>()
+    if (allExisting?.length) {
+      const existingBlocksData = await orca.invokeBackend("get-blocks", allExisting)
+      if (existingBlocksData) {
+        for (const b of existingBlocksData as Block[]) {
+          if (!b) continue
+          const uuidProp = b.properties?.find(p => p.name === "ID")
+          if (uuidProp?.value) existingBlocks.set(uuidProp.value as string, b.id)
         }
       }
+    }
+
+    // 全量同步时：清除旧结构
+    if (fullSync && existingBlocks.size > 0) {
+      orca.notify("info", t("Cleaning up old data before full sync..."))
+      const idsToDelete = [...existingBlocks.values()]
+      for (let i = 0; i < idsToDelete.length; i += 100) {
+        try {
+          await orca.commands.invokeEditorCommand(
+            "core.editor.deleteBlocks", null, idsToDelete.slice(i, i + 100),
+          )
+        } catch (e) {
+          console.warn("MEMOS SYNC: Failed to delete batch", e)
+        }
+      }
+      existingBlocks.clear()
     }
 
     for (const [date, memosInDate] of memosByDate.entries()) {
@@ -212,11 +228,11 @@ async function syncMemos(fullSync: boolean) {
       const inbox = await ensureInbox(journal, inboxName)
 
       for (const memo of memosInDate) {
-        await syncMemo(memo, inbox, noteTag, memosApiUrl)
+        await syncMemo(memo, inbox, noteTag, memosApiUrl, existingBlocks)
         syncedCount++
         // 每 20 条通知一次进度
         if (syncedCount % 20 === 0 || syncedCount === totalMemos) {
-          orca.notify("info", t(`Syncing... ${syncedCount}/${totalMemos}`))
+          orca.notify("info", `Syncing... ${syncedCount}/${totalMemos}`)
         }
       }
     }
@@ -298,15 +314,15 @@ function xhrRequest(url: string, token: string): Promise<any> {
           try {
             resolve(JSON.parse(xhr.responseText))
           } catch (e) {
-            reject(new Error(`Failed to parse JSON: ${xhr.responseText.substring(0, 200)}`))
+            reject(new Error(`Failed to parse JSON: ${(xhr.responseText || "").substring(0, 200)}`))
           }
         } else {
-          reject(new Error(`HTTP ${xhr.status}: ${xhr.statusText}. Response: ${xhr.responseText.substring(0, 200)}`))
+          reject(new Error(`HTTP ${xhr.status}: ${xhr.statusText}. Response: ${(xhr.responseText || "").substring(0, 200)}`))
         }
       }
     }
     xhr.onerror = () => {
-      reject(new Error(`Network error. Response: ${xhr.responseText.substring(0, 200)}`))
+      reject(new Error(`Network error. Response: ${(xhr.responseText || "").substring(0, 200)}`))
     }
     xhr.send()
   })
@@ -317,27 +333,13 @@ async function syncMemo(
   inbox: Block,
   noteTag: string,
   memosApiUrl: string,
+  existingBlocks: Map<string, DbId>,
 ) {
   try {
     const memoId = memo.name.replace("memos/", "")
 
-    // 1. 查重：按 #Memos Note 标签的 ID 属性查找
-    const resultIds = (await orca.invokeBackend("query", {
-      q: {
-        kind: 1,
-        conditions: [
-          {
-            kind: 4,
-            name: noteTag,
-            properties: [{ name: "ID", op: 1, value: memoId }],
-          },
-        ],
-      },
-      pageSize: 1,
-    } as QueryDescription)) as DbId[]
-
-    // 查重：已有块跳过（已在全量同步开始阶段一次性清除）
-    if (resultIds.length > 0) {
+    // 查重：从批量查询的 Map 中 O(1) 查找（替代逐条 API 查询）
+    if (existingBlocks.has(memoId)) {
       return
     }
 
