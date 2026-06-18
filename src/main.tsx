@@ -186,43 +186,47 @@ async function syncMemos(fullSync: boolean) {
     const totalMemos = memos.length
     let syncedCount = 0
 
-    // 批量查询已存在的 Memos Note 块，构建 ID 查找表（替代逐条 N+1 查询）
-    const allExisting = (await orca.invokeBackend("query", {
+    // 批量查询已存在的 Memos Note 块（用于删除或查重）
+    const allExistingIds = (await orca.invokeBackend("query", {
       q: { kind: 1, conditions: [{ kind: 4, name: noteTag }] },
       pageSize: 100000,
     } as QueryDescription)) as DbId[]
-    const existingBlocks = new Map<string, DbId>()
-    if (allExisting?.length) {
-      const existingBlocksData = await orca.invokeBackend("get-blocks", allExisting)
-      if (existingBlocksData) {
-        for (const b of existingBlocksData as Block[]) {
-          if (!b) continue
-          // 优先从根块 ID 属性读取（新格式）
-          const idProp = b.properties?.find(p => p.name === "ID")
-          if (idProp?.value) {
-            existingBlocks.set(idProp.value as string, b.id)
-          } else if (b.text) {
-            // 回退：用根块文本作为 memoId（兼容旧格式块）
-            existingBlocks.set(b.text, b.id)
+
+    let existingBlocks: Map<string, DbId>
+
+    if (fullSync) {
+      // 全量同步：先删除所有旧块（用完整 ID 列表，不因去重遗漏重复块）
+      if (allExistingIds?.length) {
+        orca.notify("info", t("Cleaning up old data before full sync..."))
+        for (let i = 0; i < allExistingIds.length; i += 100) {
+          try {
+            await orca.commands.invokeEditorCommand(
+              "core.editor.deleteBlocks", null, allExistingIds.slice(i, i + 100),
+            )
+          } catch (e) {
+            console.warn("MEMOS SYNC: Failed to delete batch", e)
           }
         }
       }
-    }
-
-    // 全量同步时：清除旧结构
-    if (fullSync && existingBlocks.size > 0) {
-      orca.notify("info", t("Cleaning up old data before full sync..."))
-      const idsToDelete = [...existingBlocks.values()]
-      for (let i = 0; i < idsToDelete.length; i += 100) {
-        try {
-          await orca.commands.invokeEditorCommand(
-            "core.editor.deleteBlocks", null, idsToDelete.slice(i, i + 100),
-          )
-        } catch (e) {
-          console.warn("MEMOS SYNC: Failed to delete batch", e)
+      // 全量同步不需要查重，所有 memo 都按新块创建
+      existingBlocks = new Map()
+    } else {
+      // 增量同步：构建 memoId → blockId 查重映射表
+      existingBlocks = new Map<string, DbId>()
+      if (allExistingIds?.length) {
+        const blocksData = await orca.invokeBackend("get-blocks", allExistingIds) as Block[]
+        if (blocksData) {
+          for (const b of blocksData) {
+            if (!b) continue
+            const idProp = b.properties?.find(p => p.name === "ID")
+            const memoId = (idProp?.value as string) || b.text
+            // Map 按 memoId 去重：只保留第一个遇到的块 ID（查重用就足够了）
+            if (memoId && !existingBlocks.has(memoId)) {
+              existingBlocks.set(memoId, b.id)
+            }
+          }
         }
       }
-      existingBlocks.clear()
     }
 
     for (const [date, memosInDate] of memosByDate.entries()) {
