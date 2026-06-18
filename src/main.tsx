@@ -197,8 +197,14 @@ async function syncMemos(fullSync: boolean) {
       if (existingBlocksData) {
         for (const b of existingBlocksData as Block[]) {
           if (!b) continue
-          const uuidProp = b.properties?.find(p => p.name === "ID")
-          if (uuidProp?.value) existingBlocks.set(uuidProp.value as string, b.id)
+          // 优先从根块 ID 属性读取（新格式）
+          const idProp = b.properties?.find(p => p.name === "ID")
+          if (idProp?.value) {
+            existingBlocks.set(idProp.value as string, b.id)
+          } else if (b.text) {
+            // 回退：用根块文本作为 memoId（兼容旧格式块）
+            existingBlocks.set(b.text, b.id)
+          }
         }
       }
     }
@@ -366,7 +372,13 @@ async function syncMemo(
     let noteBlock = orca.state.blocks[rootId] ?? null
     if (!noteBlock) return
 
-    // 根块标签：仅 #Memos Note，ID 存于标签属性
+    // 在根块上存一份 ID 属性（供批量查重使用，get-blocks 可读取）
+    await orca.commands.invokeEditorCommand(
+      "core.editor.setProperties", null, [rootId],
+      [{ name: "ID", type: 1, value: memoId }],
+    )
+
+    // 根块标签：仅 #Memos Note，ID 存于标签属性（供精确查询使用）
     await orca.commands.invokeEditorCommand(
       "core.editor.insertTag",
       null,
