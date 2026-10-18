@@ -371,8 +371,9 @@ async function syncMemo(
     }
 
     // 提取标题（第2层用）：第一行/首句，最多100字符
+    // 若首行是引用（以 "> " 开头），剥掉前缀，避免标题带上引号符号
     const paragraphs = cleanContent.split("\n").filter((p) => p.trim())
-    const titleText = (paragraphs[0] || memoId).substring(0, 100)
+    const titleText = (paragraphs[0] || memoId).replace(/^>\s?/, "").substring(0, 100)
     const bodyParas = paragraphs.slice(1).filter((p) => p.trim())
 
     // ===== 第1层：根块（纯 ID 文本，不含 # 以免被 Orca 当作标签引用解析） =====
@@ -421,17 +422,38 @@ async function syncMemo(
     }
 
     // ===== 第3层：内容块（标题块的子块） =====
+    // 识别 Memos 的引用语法 "> ..."，剥掉前缀并以 quote2 块类型插入，
+    // 让虎鲸渲染成引用格式（Orca 1.x 真实引用块 _repr 为 {"type":"quote2"}，
+    // 非文档所述的 "quote"）。连续的引用行合并为同一个引用块。
     if (bodyParas.length > 0) {
       const titleBlock = orca.state.blocks[titleId]
       if (titleBlock) {
+        const QUOTE_RE = /^>\s?/
         let prevContentId: DbId | null = null
-        for (const para of bodyParas) {
+        let i = 0
+        while (i < bodyParas.length) {
+          const para = bodyParas[i].trim()
+          const isQuote = QUOTE_RE.test(para)
+          let text: string
+          if (isQuote) {
+            // 合并连续的引用行，避免拆成多个独立引用块
+            const lines: string[] = []
+            while (i < bodyParas.length && QUOTE_RE.test(bodyParas[i].trim())) {
+              lines.push(bodyParas[i].trim().replace(QUOTE_RE, ""))
+              i++
+            }
+            text = lines.join("\n")
+          } else {
+            text = para
+            i++
+          }
           const paraId = await orca.commands.invokeEditorCommand(
             "core.editor.insertBlock",
             null,
             prevContentId ? orca.state.blocks[prevContentId] : titleBlock,
             prevContentId ? "after" : "firstChild",
-            [{ t: "t", v: para.trim() }],
+            [{ t: "t", v: text }],
+            isQuote ? { type: "quote2" } : { type: "text" },
           )
           if (paraId) prevContentId = paraId
         }
