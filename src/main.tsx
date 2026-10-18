@@ -3,6 +3,7 @@ import LogoImg from "../icon.png"
 import { setupL10N, t } from "./libs/l10n"
 import { ensureInbox, groupBy } from "./libs/utils"
 import type { Block, DbId, QueryDescription } from "./orca"
+import { parseBlocks, stripBlockPrefix } from "./parseBlocks"
 import zhCN from "./translations/zhCN"
 
 let pluginName: string
@@ -38,22 +39,6 @@ interface MemosListResponse {
 /** 增量查重表条目：只记根块 ID（① 更新方式＝核对后重建，再删旧根块） */
 interface ExistingEntry {
   rootId: DbId
-}
-
-/** 引用标记：`> ` 可重复（`>> `），段首判定 */
-const QUOTE_LINE_RE = /^(?:>\s*)+/
-/**
- * 行内引用切分（⑯）：Memos 正文里「他说： > 这句话」这种引用被软换行压平到同一段。
- * 切点放在 `>` 本身，前方标点保留在文本段。
- */
-const INLINE_QUOTE_RE = /[：:。；;，,、]\s*>+\s*/
-
-function stripQuotePrefix(s: string): string {
-  return s.replace(QUOTE_LINE_RE, "").trim()
-}
-
-function isQuoteLine(s: string): boolean {
-  return s.startsWith(">")
 }
 
 export async function load(_name: string) {
@@ -697,7 +682,7 @@ function parseMemosContent(
   const paragraphs = cleanContent.split("\n").filter((p) => p.trim())
   const first = paragraphs[0] ?? memoId
   // 首行若是引用（`> ` 开头），剥掉前缀，避免标题带上引号符号
-  const titleText = stripQuotePrefix(first).substring(0, 100)
+  const titleText = stripBlockPrefix(first).substring(0, 100)
   const bodyParas = paragraphs.slice(1).filter((p) => p.trim())
   return { titleText, bodyParas }
 }
@@ -869,103 +854,83 @@ async function writeBody(titleId: DbId, bodyParas: string[]) {
     )
   }
 
-  // 1) 摊平成片段序列
-  const segments: Array<{ quote: boolean; text: string }> = []
-  for (const raw of bodyParas) {
-    const para = raw.trim()
-    if (!para) continue
-    if (isQuoteLine(para)) {
-      segments.push({ quote: true, text: stripQuotePrefix(para) })
-      continue
-    }
-    for (const seg of splitInlineQuotes(para)) segments.push(seg)
-  }
+  // 解析成「块规格」后逐块渲染（块级 Markdown：标题/列表/代码/分隔线/引用）
+  const specs = parseBlocks(bodyParas)
 
-  // 2) 写入：连续 quote 片段合并为同一个容器
   let prev: DbId | null = null
-  let i = 0
-  while (i < segments.length) {
-    const seg = segments[i]
+  for (const spec of specs) {
     const anchor = prev
       ? orca.state.blocks[prev] ?? orca.state.blocks[titleId]
       : orca.state.blocks[titleId]
     const position = prev ? "after" : "firstChild"
     if (!anchor) break
 
-    if (!seg.quote) {
-      const text = seg.text.trim()
-      i++
-      if (!text) continue
-      const id = await orca.commands.invokeEditorCommand(
+    // 引用是容器：空 quote2 + 每行一个 text 子块
+    if (spec.kind === "quote") {
+      const quoteId = await orca.commands.invokeEditorCommand(
         "core.editor.insertBlock",
         null,
         anchor,
         position,
-        [{ t: "t", v: text }],
-        { type: "text" },
+        null, // 容器 content 必须为 null
+        { type: "quote2" },
       )
-      if (id) prev = id
+      if (!quoteId) continue
+      const quoteBlock = orca.state.blocks[quoteId]
+      if (quoteBlock) {
+        for (const line of spec.lines) {
+          await orca.commands.invokeEditorCommand(
+            "core.editor.insertBlock",
+            null,
+            quoteBlock,
+            "lastChild",
+            [{ t: "t", v: line }],
+            { type: "text" },
+          )
+        }
+      }
+      prev = quoteId
       continue
     }
 
-    // 连续引用片段 → 一个空 quote2 容器
-    const lines: string[] = []
-    while (i < segments.length && segments[i].quote) {
-      const text = segments[i].text.trim()
-      if (text) lines.push(text)
-      i++
+    // 其余类型都是内联 repr（content 直接放文本）
+    let content: Array<{ t: string; v: string }> | null = null
+    let repr: Record<string, unknown> = { type: "text" }
+    switch (spec.kind) {
+      case "text":
+        content = [{ t: "t", v: spec.text }]
+        repr = { type: "text" }
+        break
+      case "ul":
+        content = [{ t: "t", v: spec.text }]
+        repr = { type: "ul" }
+        break
+      case "ol":
+        content = [{ t: "t", v: spec.text }]
+        repr = { type: "ol" }
+        break
+      case "heading":
+        content = [{ t: "t", v: spec.text }]
+        repr = { type: "heading", level: spec.level }
+        break
+      case "code":
+        content = [{ t: "t", v: spec.text }]
+        repr = { type: "code", lang: spec.lang, wrap: false }
+        break
+      case "hr":
+        content = null
+        repr = { type: "hr" }
+        break
     }
-    if (!lines.length) continue
 
-    const quoteId = await orca.commands.invokeEditorCommand(
+    const id = await orca.commands.invokeEditorCommand(
       "core.editor.insertBlock",
       null,
       anchor,
       position,
-      null, // 容器 content 必须为 null
-      { type: "quote2" },
+      content,
+      repr,
     )
-    if (!quoteId) continue
-    const quoteBlock = orca.state.blocks[quoteId]
-    if (quoteBlock) {
-      for (const line of lines) {
-        await orca.commands.invokeEditorCommand(
-          "core.editor.insertBlock",
-          null,
-          quoteBlock,
-          "lastChild",
-          [{ t: "t", v: line }],
-          { type: "text" },
-        )
-      }
-    }
-    prev = quoteId
+    if (id) prev = id
   }
-}
-
-/**
- * ⑯ 把一段文字按「标点 + `>`」切成 文本/引用 片段。
- * 说明：扁平化后的段落里，引用之后的叙述文字无法与引用本身区分，
- * 因此按「引用持续到下一个 `>` 之前」处理（保真但不精确；完整语义由 M4 方案 B 解决）。
- */
-function splitInlineQuotes(para: string): Array<{
-  quote: boolean
-  text: string
-}> {
-  const out: Array<{ quote: boolean; text: string }> = []
-  let rest = para
-  let quoteMode = false
-
-  while (true) {
-    const m = INLINE_QUOTE_RE.exec(rest)
-    if (!m) break
-    const gt = m.index + m[0].lastIndexOf(">")
-    const head = rest.slice(0, gt).trim()
-    if (head) out.push({ quote: quoteMode, text: head })
-    rest = rest.slice(gt + 1).trim()
-    quoteMode = true
-    if (!INLINE_QUOTE_RE.test(rest)) break
-  }
-  if (rest.trim()) out.push({ quote: quoteMode, text: rest.trim() })
-  return out.length ? out : [{ quote: false, text: para }]
 }
