@@ -130,6 +130,16 @@ export async function load(_name: string) {
     )
   }
 
+  if (orca.state.commands["memos.cleanup"] == null) {
+    orca.commands.registerCommand(
+      "memos.cleanup",
+      async () => {
+        await checkDeletedMemos()
+      },
+      t("检查已删除的 Memo（干跑）"),
+    )
+  }
+
   if (orca.state.headbarButtons["memos.sync"] == null) {
     orca.headbar.registerHeadbarButton("memos.sync", () => (
       <HoverContextMenu
@@ -147,6 +157,13 @@ export async function load(_name: string) {
               onClick={async () => {
                 closeMenu()
                 await orca.commands.invokeCommand("memos.sync", true)
+              }}
+            />
+            <MenuText
+              title={t("检查已删除的 Memo（干跑）")}
+              onClick={async () => {
+                closeMenu()
+                await orca.commands.invokeCommand("memos.cleanup")
               }}
             />
           </>
@@ -168,6 +185,7 @@ export async function load(_name: string) {
 export async function unload() {
   orca.headbar.unregisterHeadbarButton("memos.sync")
   orca.commands.unregisterCommand("memos.sync")
+  orca.commands.unregisterCommand("memos.cleanup")
   orca.themes.removeCSS(pluginName)
 
   console.log(`${pluginName} unloaded.`)
@@ -448,6 +466,109 @@ async function buildExistingMap(
     map.set(memoId, { rootId: b.id })
   }
   return map
+}
+
+/**
+ * ⑭ 检查「Memos 已删除、但 Orca 仍保留」的 memo —— **干跑：只报告，不删除**。
+ *
+ * ⚠️ 不能用增量拉取的集合做差集：增量只拉 `updated_ts >= 水位` 的条目，
+ *    集合本身不完整，会把大量正常块误判成"已删除"。这里**全量拉** memo id（不带任何 filter），
+ *    并且只与「带 ID 属性的插件根块」比对。
+ * 删除动作留给人来确认（或走全量同步），不在本函数内自动执行。
+ */
+async function checkDeletedMemos() {
+  if (syncing) {
+    orca.notify("warn", t("同步正在进行中，请稍候"))
+    return
+  }
+  syncing = true
+  try {
+    const settings = orca.state.plugins[pluginName]?.settings
+    if (!settings) {
+      orca.notify("error", t("Plugin settings not found."))
+      return
+    }
+    const memosApiUrl: string = settings.memosApiUrl
+    const memosApiToken: string = settings.memosApiToken
+    const noteTag: string = settings.noteTag || "Memos Note"
+    if (!memosApiUrl || !memosApiToken) {
+      orca.notify("warn", t("Please configure memos API URL and token first."))
+      return
+    }
+
+    orca.notify("info", "正在拉取 Memos 全量 id（用于对比）…")
+    const remoteIds = await fetchAllMemoIds(memosApiUrl, memosApiToken)
+
+    const allExistingIds = await queryMemosNoteBlockIds(noteTag)
+    const blocks = ((await orca.invokeBackend("get-blocks", allExistingIds)) ??
+      []) as Block[]
+
+    const orphans: Array<{ blockId: DbId; memoId: string }> = []
+    for (const b of blocks) {
+      if (!b) continue
+      const idProp = b.properties?.find((p) => p.name === "ID")
+      if (!idProp?.value) continue
+      const memoId = String(idProp.value).trim()
+      if (memoId && !remoteIds.has(memoId)) {
+        orphans.push({ blockId: b.id, memoId })
+      }
+    }
+
+    console.log("MEMOS SYNC: 疑似已删除清单", orphans)
+
+    if (!orphans.length) {
+      orca.notify(
+        "success",
+        `检查完成：Memos ${remoteIds.size} 条 / Orca ${blocks.length} 块，未发现已删除的残留。`,
+      )
+      return
+    }
+    const preview = orphans
+      .slice(0, 5)
+      .map((o) => `${o.memoId}(块${o.blockId})`)
+      .join("、")
+    orca.notify(
+      "warn",
+      `发现 ${orphans.length} 条 Memos 已删除但 Orca 仍保留：${preview}${orphans.length > 5 ? " …" : ""}（仅检测，未删除；完整清单见控制台）`,
+    )
+  } catch (err) {
+    console.error("MEMOS CLEANUP:", err)
+    orca.notify(
+      "error",
+      `检查失败：${err instanceof Error ? err.message : String(err)}`,
+    )
+  } finally {
+    syncing = false
+  }
+}
+
+/** 全量拉取 Memos 的 memo id（不带 filter，避免把"未同步/被可见性过滤"误判成"已删除"） */
+async function fetchAllMemoIds(
+  apiUrl: string,
+  token: string,
+): Promise<Set<string>> {
+  const baseUrl = apiUrl.replace(/\/$/, "")
+  const url = new URL(`${baseUrl}/api/v1/memos`)
+  url.searchParams.set("pageSize", "100")
+  const ids = new Set<string>()
+  let pageToken: string | undefined
+  let pages = 0
+  do {
+    if (pageToken) {
+      url.searchParams.set("pageToken", pageToken)
+    } else {
+      url.searchParams.delete("page_token")
+    }
+    const data = await xhrRequest(url.toString(), token)
+    for (const m of data.memos ?? []) {
+      const id = /^memos\/(.+)$/.exec(m.name ?? "")?.[1]?.trim()
+      if (id) ids.add(id)
+    }
+    pageToken = data.nextPageToken
+    pages++
+    if (pages % 10 === 0) orca.notify("info", `已拉取 ${ids.size} 条…`)
+  } while (pageToken)
+  return ids
 }
 
 async function fetchMemos(
