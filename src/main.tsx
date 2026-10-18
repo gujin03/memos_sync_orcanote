@@ -422,9 +422,13 @@ async function syncMemo(
     }
 
     // ===== 第3层：内容块（标题块的子块） =====
-    // 识别 Memos 的引用语法 "> ..."，剥掉前缀并以 quote2 块类型插入，
-    // 让虎鲸渲染成引用格式（Orca 1.x 真实引用块 _repr 为 {"type":"quote2"}，
-    // 非文档所述的 "quote"）。连续的引用行合并为同一个引用块。
+    // 识别 Memos 的引用语法 "> ..."，剥掉前缀并渲染成 Orca 引用块。
+    //
+    // ⚠️ 关键：Orca 的 quote2 是「容器块」——它只渲染自己的**子块**，不渲染内联
+    // content。原生引用块的真实形态是 content=NULL + 一个子 text 块（库内 112/149
+    // 个 quote2 均如此）。若把正文直接作为 content 塞进 quote2，界面会显示成带
+    // 「引述」占位符的空引用块（v1.1.0 的线上 bug）。
+    // 因此这里先建一个空的 quote2 容器，再把正文作为 text 子块插进去。
     if (bodyParas.length > 0) {
       const titleBlock = orca.state.blocks[titleId]
       if (titleBlock) {
@@ -447,15 +451,49 @@ async function syncMemo(
             text = para
             i++
           }
-          const paraId = await orca.commands.invokeEditorCommand(
-            "core.editor.insertBlock",
-            null,
-            prevContentId ? orca.state.blocks[prevContentId] : titleBlock,
-            prevContentId ? "after" : "firstChild",
-            [{ t: "t", v: text }],
-            isQuote ? { type: "quote2" } : { type: "text" },
-          )
-          if (paraId) prevContentId = paraId
+          // 剥掉 "> " 后可能为空（如单独一行 ">"），跳过
+          if (!text.trim()) continue
+
+          const anchor = prevContentId
+            ? orca.state.blocks[prevContentId]
+            : titleBlock
+          const position = prevContentId ? "after" : "firstChild"
+
+          if (isQuote) {
+            // 1) 建空的 quote2 容器（content 必须传 null）
+            const quoteId = await orca.commands.invokeEditorCommand(
+              "core.editor.insertBlock",
+              null,
+              anchor,
+              position,
+              null,
+              { type: "quote2" },
+            )
+            if (!quoteId) continue
+            // 2) 正文作为 text 子块放进容器内（quote2 渲染的正是子块）
+            const quoteBlock = orca.state.blocks[quoteId]
+            if (quoteBlock) {
+              await orca.commands.invokeEditorCommand(
+                "core.editor.insertBlock",
+                null,
+                quoteBlock,
+                "lastChild",
+                [{ t: "t", v: text }],
+                { type: "text" },
+              )
+            }
+            prevContentId = quoteId
+          } else {
+            const paraId = await orca.commands.invokeEditorCommand(
+              "core.editor.insertBlock",
+              null,
+              anchor,
+              position,
+              [{ t: "t", v: text }],
+              { type: "text" },
+            )
+            if (paraId) prevContentId = paraId
+          }
         }
       }
     }
