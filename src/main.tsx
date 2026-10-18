@@ -3,7 +3,12 @@ import LogoImg from "../icon.png"
 import { setupL10N, t } from "./libs/l10n"
 import { ensureInbox, groupBy } from "./libs/utils"
 import type { Block, DbId, QueryDescription } from "./orca"
-import { parseBlocks, stripBlockPrefix } from "./parseBlocks"
+import {
+  fragmentsToText,
+  parseBlocks,
+  parseInline,
+  stripBlockPrefix,
+} from "./parseBlocks"
 import zhCN from "./translations/zhCN"
 
 let pluginName: string
@@ -125,17 +130,6 @@ export async function load(_name: string) {
     )
   }
 
-  // 【临时】运行态探测：为 ⑪-B（batchInsertHTML 需要真实 panelId）取证，验证后删除
-  if (orca.state.commands["memos.probe"] == null) {
-    orca.commands.registerCommand(
-      "memos.probe",
-      async () => {
-        await probeRuntime()
-      },
-      t("探测 Orca 运行态（临时）"),
-    )
-  }
-
   if (orca.state.headbarButtons["memos.sync"] == null) {
     orca.headbar.registerHeadbarButton("memos.sync", () => (
       <HoverContextMenu
@@ -162,13 +156,6 @@ export async function load(_name: string) {
                 await orca.commands.invokeCommand("memos.cleanup")
               }}
             />
-            <MenuText
-              title={t("探测 Orca 运行态（临时）")}
-              onClick={async () => {
-                closeMenu()
-                await orca.commands.invokeCommand("memos.probe")
-              }}
-            />
           </>
         )}
       >
@@ -189,7 +176,6 @@ export async function unload() {
   orca.headbar.unregisterHeadbarButton("memos.sync")
   orca.commands.unregisterCommand("memos.sync")
   orca.commands.unregisterCommand("memos.cleanup")
-  orca.commands.unregisterCommand("memos.probe")
   orca.themes.removeCSS(pluginName)
 
   console.log(`${pluginName} unloaded.`)
@@ -198,121 +184,6 @@ export async function unload() {
 /**
  * 同步入口（⑬ 并发闸门）：所有异常在此统一上报，避免"静默失败"。
  */
-/**
- * 【临时诊断】探测 Orca 运行态：确认能否拿到可用的 panelId。
- *
- * 背景：`core.editor.batchInsertHTML` 内部会 `orca.nav.findViewPanel(panelId)` 然后
- * 直接访问 `.viewState`；插件侧若拿不到真实 panelId，这条路就走不通（见方案 §12）。
- * 本命令**只读**：不写库、不改任何块，结果打印到控制台并复制到剪贴板。
- * 采集完（确认字段名）后应删除本命令与对应菜单项。
- */
-async function probeRuntime() {
-  try {
-    const O = orca as unknown as Record<string, any>
-    const state: Record<string, any> = O.state ?? {}
-    const panelsNode: any = state.panels
-    const keysOf = (o: any): string[] =>
-      o && typeof o === "object" ? Object.keys(o) : []
-
-    // orca.state.panels 是「布局树」：内部节点 {id,direction,children,height}，
-    // 叶子是字符串 = 真实 panelId。v1 误当成 map，取到的是节点字段名。
-    const collectPanelIds = (node: any, out: string[], depth = 0): string[] => {
-      if (node == null || depth > 30) return out
-      if (typeof node === "string") {
-        out.push(node)
-        return out
-      }
-      if (Array.isArray(node)) {
-        for (const c of node) collectPanelIds(c, out, depth + 1)
-        return out
-      }
-      if (typeof node === "object" && Array.isArray(node.children)) {
-        for (const c of node.children) collectPanelIds(c, out, depth + 1)
-      }
-      return out
-    }
-
-    const layoutIds = Array.from(new Set(collectPanelIds(panelsNode, [])))
-    const activePanel: string | null =
-      typeof state.activePanel === "string" ? state.activePanel : null
-
-    const inspect = (pid: string) => {
-      const rec: Record<string, any> = { panelId: pid }
-      try {
-        rec.isViewPanel = typeof O.nav?.isViewPanel === "function" ? O.nav.isViewPanel(pid) : "n/a"
-      } catch (e) {
-        rec.isViewPanel = `throw: ${e instanceof Error ? e.message : String(e)}`
-      }
-      try {
-        const vp = O.nav?.findViewPanel?.(pid, panelsNode)
-        rec.found = Boolean(vp)
-        if (vp) {
-          rec.viewPanelKeys = keysOf(vp).slice(0, 20)
-          rec.viewStateKeys = keysOf(vp.viewState).slice(0, 30)
-          rec.editorKeys = keysOf(vp.viewState?.editor).slice(0, 30)
-          rec.hasEditor = Boolean(vp.viewState?.editor)
-          rec.editorKind =
-            typeof vp.viewState?.editor === "object"
-              ? "object"
-              : typeof vp.viewState?.editor
-        }
-      } catch (e) {
-        rec.found = `throw: ${e instanceof Error ? e.message : String(e)}`
-      }
-      return rec
-    }
-
-    const snapshot = {
-      panelsShape: {
-        type: typeof panelsNode,
-        isArray: Array.isArray(panelsNode),
-        keys: keysOf(panelsNode),
-        direction: panelsNode?.direction ?? null,
-        childCount: Array.isArray(panelsNode?.children)
-          ? panelsNode.children.length
-          : null,
-      },
-      layoutPanelIds: layoutIds,
-      activePanel,
-      activePanelInLayout: activePanel ? layoutIds.includes(activePanel) : null,
-      inspections: [
-        ...(activePanel ? [inspect(activePanel)] : []),
-        ...layoutIds
-          .filter((id) => id !== activePanel)
-          .slice(0, 3)
-          .map(inspect),
-      ],
-      navKeys: keysOf(O.nav).slice(0, 40),
-      stateKeysMatching: keysOf(state).filter((k) =>
-        /panel|view|editor|cursor|focus|active/i.test(k),
-      ),
-    }
-
-    const json = JSON.stringify(snapshot, null, 2)
-    console.log("MEMOS SYNC: 运行态探测结果 v2\n" + json)
-
-    let copied = false
-    try {
-      await navigator.clipboard.writeText(json)
-      copied = true
-    } catch (e) {
-      console.warn("MEMOS SYNC: 写剪贴板失败", e)
-    }
-    const first = snapshot.inspections[0]
-    orca.notify(
-      "success",
-      `探测 v2：${layoutIds.length} 个面板，activePanel=${activePanel ?? "null"}；` +
-        `findViewPanel=${first?.found ? "ok" : String(first?.found)}，hasEditor=${first?.hasEditor ?? "?"}；` +
-        `结果已${copied ? "复制到剪贴板" : "打印到控制台"}`,
-    )
-  } catch (e) {
-    console.error("MEMOS SYNC: probe error", e)
-    orca.notify(
-      "error",
-      `探测失败：${e instanceof Error ? e.message : String(e)}`,
-    )
-  }
-}
 
 async function syncMemos(fullSync: boolean) {
   if (syncing) {
@@ -817,7 +688,9 @@ function parseMemosContent(
   const paragraphs = cleanContent.split("\n").filter((p) => p.trim())
   const first = paragraphs[0] ?? memoId
   // 首行若是引用（`> ` 开头），剥掉前缀，避免标题带上引号符号
-  const titleText = stripBlockPrefix(first).substring(0, 100)
+  const titleText = fragmentsToText(
+    parseInline(stripBlockPrefix(first)),
+  ).substring(0, 100)
   const bodyParas = paragraphs.slice(1).filter((p) => p.trim())
   return { titleText, bodyParas }
 }
@@ -1019,7 +892,7 @@ async function writeBody(titleId: DbId, bodyParas: string[]) {
             null,
             quoteBlock,
             "lastChild",
-            [{ t: "t", v: line }],
+            line, // 已是片段数组（可含粗体/链接）
             { type: "text" },
           )
         }
@@ -1028,24 +901,24 @@ async function writeBody(titleId: DbId, bodyParas: string[]) {
       continue
     }
 
-    // 其余类型都是内联 repr（content 直接放文本）
-    let content: Array<{ t: string; v: string }> | null = null
+    // 其余类型都是内联 repr：content 直接放片段数组（可含粗体/斜体/代码/链接）
+    let content: Record<string, unknown>[] | null = null
     let repr: Record<string, unknown> = { type: "text" }
     switch (spec.kind) {
       case "text":
-        content = [{ t: "t", v: spec.text }]
+        content = spec.content
         repr = { type: "text" }
         break
       case "ul":
-        content = [{ t: "t", v: spec.text }]
+        content = spec.content
         repr = { type: "ul" }
         break
       case "ol":
-        content = [{ t: "t", v: spec.text }]
+        content = spec.content
         repr = { type: "ol" }
         break
       case "heading":
-        content = [{ t: "t", v: spec.text }]
+        content = spec.content
         repr = { type: "heading", level: spec.level }
         break
       case "code":
@@ -1055,6 +928,10 @@ async function writeBody(titleId: DbId, bodyParas: string[]) {
       case "hr":
         content = null
         repr = { type: "hr" }
+        break
+      case "image":
+        content = null
+        repr = { type: "image", src: spec.src }
         break
     }
 
