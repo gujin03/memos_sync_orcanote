@@ -265,20 +265,27 @@ async function fetchMemos(
 ): Promise<MemosMemo[]> {
   const baseUrl = apiUrl.replace(/\/$/, "")
   const url = new URL(`${baseUrl}/api/v1/memos`)
-  url.searchParams.set("page_size", "100")
-  url.searchParams.set("order_by", "create_time desc")
+  // v0.31.0 的 grpc-gateway 按 json_name（camelCase）匹配 query key，
+  // 实测 page_size / order_by 在本实例也能工作，但 camelCase 是规范写法、对其他实例更稳。
+  url.searchParams.set("pageSize", "100")
+  url.searchParams.set("orderBy", "create_time desc")
 
   // Build server-side filter (CEL syntax — Memos uses Unix second timestamps for dates)
   // created_ts and updated_ts map to the DB's Unix timestamp columns.
+  // ⚠️ 关键修复（实测验证）：CEL 中 created_ts 是 timestamp 类型，裸整数比较
+  //   `created_ts >= 1700000000` 会报
+  //   "found no matching overload for '_>=_' applied to '(timestamp, int)'" → HTTP 400，
+  //   导致每次 fetchMemos 都失败、整轮同步报错。必须用 timestamp() 包裹：
+  //   `created_ts >= timestamp(1700000000)`（参数仍为 Unix 秒）。
   // The returned memo.createTime is still an ISO 8601 string — no conflict.
   const filters: string[] = []
   if (startDate) {
     const startTs = Math.floor(new Date(startDate).getTime() / 1000)
-    filters.push(`created_ts >= ${startTs}`)
+    filters.push(`created_ts >= timestamp(${startTs})`)
   }
   if (lastSyncTime) {
     const lastSyncTs = Math.floor(lastSyncTime / 1000)
-    filters.push(`updated_ts >= ${lastSyncTs}`)
+    filters.push(`updated_ts >= timestamp(${lastSyncTs})`)
   }
   if (
     visibilityFilter?.length > 0 &&
@@ -296,7 +303,7 @@ async function fetchMemos(
 
   do {
     if (pageToken) {
-      url.searchParams.set("page_token", pageToken)
+      url.searchParams.set("pageToken", pageToken)
     } else {
       url.searchParams.delete("page_token")
     }
@@ -434,7 +441,9 @@ async function syncMemo(
     // ===== 第4层：链接块（最后，溯源用） =====
     // 重新获取根块（title 插入后 children 已变，旧引用 stale）
     noteBlock = orca.state.blocks[rootId] ?? noteBlock
-    const memoUrl = `${memosApiUrl.replace(/\/$/, "")}/m/${memoId}`
+    // v0.31.0 网页路由为 /memos/{uid}（navigation.ts: directMemoPrefix = "/memos/"），
+    // 旧路由 /m/{uid} 在新实例中会 404，故改为 /memos/。
+    const memoUrl = `${memosApiUrl.replace(/\/$/, "")}/memos/${memoId}`
     await orca.commands.invokeEditorCommand(
       "core.editor.insertBlock",
       null,
