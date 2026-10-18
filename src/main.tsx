@@ -16,6 +16,9 @@ let syncing = false
 /** 连续失败轮次（②）：避免"有失败就不推进水位"演变成静默死锁 */
 const FAIL_ROUNDS_KEY = "failRounds"
 
+/** 本轮首条失败原因：直接带进结束提示，避免"只报失败数、查不到原因" */
+let lastSyncError = ""
+
 interface MemosMemo {
   name: string
   content: string
@@ -32,10 +35,9 @@ interface MemosListResponse {
   nextPageToken?: string
 }
 
-/** 增量查重表条目：根块 + 标题块（①，标题供更新用） */
+/** 增量查重表条目：只记根块 ID（① 更新方式＝核对后重建，再删旧根块） */
 interface ExistingEntry {
   rootId: DbId
-  titleId: DbId | null
 }
 
 /** 引用标记：`> ` 可重复（`>> `），段首判定 */
@@ -222,6 +224,7 @@ async function syncMemosInner(fullSync: boolean) {
     return
   }
 
+  lastSyncError = ""
   orca.notify("info", t("Starting to sync, please wait..."))
 
   let lastSyncTime: number | null = null
@@ -348,9 +351,12 @@ async function syncMemosInner(fullSync: boolean) {
   if (failedCount === 0) {
     orca.notify("success", t("Memos notes synced successfully."))
   } else {
+    const reason = lastSyncError
+      ? `｜首条错误：${lastSyncError.slice(0, 160)}`
+      : ""
     orca.notify(
       "warn",
-      `同步完成：成功 ${syncedCount} 条，失败 ${failedCount} 条（水位未推进，下次会重试）`,
+      `同步完成：成功 ${syncedCount} 条，失败 ${failedCount} 条（水位未推进，下次会重试）${reason}`,
     )
   }
 }
@@ -421,8 +427,7 @@ async function filterPluginRoots(
 /**
  * ⑥ 构建增量查重表：只认 `ID` 属性，不再用 `b.text` 兜底（文本兜底会误判）。
  * 无 ID 属性的块（手工创建/旧版导入）跳过并留痕，不混入查重。
- * ① 同时记录标题块：不变式 = `root.children[0]` 恒为标题块
- *    （创建顺序：根 → 标题 → 正文 → 链接块；正文是标题的子块）。
+ * ① 只记根块 ID：更新时按「新建整棵子树 + 删旧根块」重建，不再依赖 children 定位标题块。
  */
 async function buildExistingMap(
   allIds: DbId[],
@@ -440,7 +445,7 @@ async function buildExistingMap(
     }
     const memoId = String(idProp.value).trim()
     if (!memoId || map.has(memoId)) continue
-    map.set(memoId, { rootId: b.id, titleId: b.children?.[0] ?? null })
+    map.set(memoId, { rootId: b.id })
   }
   return map
 }
@@ -594,22 +599,47 @@ async function syncMemo(
       return false
     }
 
-    // ① 命中已有块 → 原地更新（标题 + 标签 + 正文），而不是直接跳过
+    // ① 命中已有块 → 重建：先在新位置建好整棵子树，成功后再删旧根块。
+    //    ⚠️ 不原地更新：`core.editor.setBlocksContent` / `removeTag` 内部会读
+    //    `orca.state.blocks[id]`，而未打开的日记页里的块并不在内存中，
+    //    `getRepr(undefined)` 会直接抛错（实测：改正文后同步「成功 0 条，失败 1 条」）。
+    //    `deleteBlocks` 只按 ID 操作，不依赖内存态，安全。
+    let oldRootId: DbId | null = null
+    let beforeAnchor: Block | null = null
     const hit = existingBlocks.get(memoId)
     if (hit) {
-      return await updateMemo(memo, memoId, hit)
+      oldRootId = hit.rootId
+      beforeAnchor = orca.state.blocks[hit.rootId] ?? null
+      if (!beforeAnchor) {
+        const fetched = ((await orca.invokeBackend("get-blocks", [
+          hit.rootId,
+        ])) ?? []) as Block[]
+        beforeAnchor = fetched?.[0] ?? null
+      }
     }
 
     const { titleText, bodyParas } = parseMemosContent(memo, memoId)
 
     // ===== 第1层：根块（纯 ID 文本，不含 # 以免被 Orca 当作标签引用解析） =====
-    const rootId = await orca.commands.invokeEditorCommand(
-      "core.editor.insertBlock",
-      null,
-      inbox,
-      "lastChild",
-      [{ t: "t", v: memoId }],
-    )
+    // 更新时插到旧根块「之前」以保持顺序；anchor 不可用则退回追加到 Inbox 末尾
+    let rootId = beforeAnchor
+      ? await orca.commands.invokeEditorCommand(
+          "core.editor.insertBlock",
+          null,
+          beforeAnchor,
+          "before",
+          [{ t: "t", v: memoId }],
+        )
+      : null
+    if (!rootId) {
+      rootId = await orca.commands.invokeEditorCommand(
+        "core.editor.insertBlock",
+        null,
+        inbox,
+        "lastChild",
+        [{ t: "t", v: memoId }],
+      )
+    }
     let noteBlock = orca.state.blocks[rootId] ?? null
     if (!noteBlock) return false
 
@@ -669,117 +699,34 @@ async function syncMemo(
       [{ t: "l", v: "🔗 Open in Memos", l: memoUrl }],
     )
 
+    // 整棵新子树建好后再删旧根块：中途失败只会留下旧块（可见、可重试），不会丢数据
+    if (oldRootId) {
+      try {
+        await orca.commands.invokeEditorCommand(
+          "core.editor.deleteBlocks",
+          null,
+          [oldRootId],
+        )
+      } catch (e) {
+        console.warn("MEMOS SYNC: 删除旧根块失败（将留下重复块）", oldRootId, e)
+      }
+    }
+
     return true
   } catch (e) {
     console.error("MEMOS SYNC: syncMemo error for", memo.name, e)
+    if (!lastSyncError) {
+      lastSyncError = `${memo.name}: ${e instanceof Error ? e.message : String(e)}`
+    }
     return false
   }
 }
 
-/**
- * ① 更新已有 memo：标题文本 + 标签差分 + 正文重建（根块与 ID 属性保持不变）。
- */
-async function updateMemo(
-  memo: MemosMemo,
-  memoId: string,
-  entry: ExistingEntry,
-): Promise<boolean> {
-  const titleId =
-    entry.titleId ?? orca.state.blocks[entry.rootId]?.children?.[0] ?? null
-  if (!titleId) {
-    console.warn("MEMOS SYNC: 找不到标题块，跳过更新", memoId)
-    return false
-  }
-
-  let titleBlock = orca.state.blocks[titleId]
-  if (!titleBlock) {
-    const fetched = ((await orca.invokeBackend("get-blocks", [titleId])) ??
-      []) as Block[]
-    titleBlock = fetched?.[0]
-  }
-  if (!titleBlock) {
-    console.warn("MEMOS SYNC: 标题块不存在，跳过更新", titleId)
-    return false
-  }
-
-  const { titleText, bodyParas } = parseMemosContent(memo, memoId)
-
-  // 标题：core.editor.setBlocksContent（setContent / setBlock 在 Orca 中不存在）
-  await orca.commands.invokeEditorCommand(
-    "core.editor.setBlocksContent",
-    null,
-    [{ id: titleId, content: [{ t: "t", v: titleText }] }],
-  )
-
-  // 标签差分
-  await syncTags(titleId, titleBlock, memo.tags ?? [])
-
-  // 正文：先删旧子块再重建（writeBody 内部负责）
-  await writeBody(titleId, bodyParas)
-
-  return true
-}
-
-/** ① 标签差分：读当前标签名（`_tags` 属性 → ref → 标签块文本），与目标集合比对 */
-async function syncTags(
-  titleId: DbId,
-  titleBlock: Block,
-  desired: string[],
-): Promise<void> {
-  const wanted = desired
-    .filter(Boolean)
-    .map((s) => s.trim())
-    .filter(Boolean)
-
-  // `_tags` 在 DB 中是「同名多行、每行一个 ref id」的形态，不是 JSON 数组
-  const tagRefIds = new Set(
-    (titleBlock.properties ?? [])
-      .filter((p) => p.name === "_tags")
-      .map((p) => Number(p.value)),
-  )
-  const tagBlockIds = (titleBlock.refs ?? [])
-    .filter((r) => tagRefIds.has(r.id))
-    .map((r) => r.to)
-
-  const current = new Set<string>()
-  if (tagBlockIds.length) {
-    const tagBlocks = ((await orca.invokeBackend(
-      "get-blocks",
-      tagBlockIds,
-    )) ?? []) as Block[]
-    for (const b of tagBlocks) {
-      if (b?.text) current.add(b.text.trim())
-    }
-  }
-
-  for (const name of wanted) {
-    if (current.has(name)) continue
-    try {
-      await orca.commands.invokeEditorCommand(
-        "core.editor.insertTag",
-        null,
-        titleId,
-        name,
-      )
-    } catch (e) {
-      console.warn("MEMOS SYNC: insertTag 失败", name, e)
-    }
-  }
-  for (const name of current) {
-    if (wanted.includes(name)) continue
-    try {
-      // removeTag 签名（据注册体）：(cursor, blockId, tagName)
-      await orca.commands.invokeEditorCommand(
-        "core.editor.removeTag",
-        null,
-        titleId,
-        name,
-      )
-    } catch (e) {
-      console.warn("MEMOS SYNC: removeTag 失败", name, e)
-    }
-  }
-}
+// 说明：早期版本在这里有 updateMemo()（setBlocksContent + removeTag 原地更新）与 syncTags()
+// （`_tags` → ref → 标签块文本的差分）。二者都已移除：
+//   - setBlocksContent 依赖 `orca.state.blocks[id]` 已在内存中，未打开的页面会抛错；
+//   - 重建整棵子树（新建 + deleteBlocks 旧根块）能同时覆盖标题/标签/正文，且只用按 ID 操作的命令。
+// 若将来需要「原地更新」（保留块 ID），必须先解决"把目标块载入 orca.state"这件事。
 
 /**
  * 正文写入（①⑮⑯ 三路径共用）。
