@@ -7,6 +7,15 @@ import zhCN from "./translations/zhCN"
 
 let pluginName: string
 
+/**
+ * 同步进行中标志（⑬）：防止连点导致两次同步并发写块 → 重复块。
+ * 并发时查重表是启动快照，第二次看不到第一次的写入。
+ */
+let syncing = false
+
+/** 连续失败轮次（②）：避免"有失败就不推进水位"演变成静默死锁 */
+const FAIL_ROUNDS_KEY = "failRounds"
+
 interface MemosMemo {
   name: string
   content: string
@@ -15,6 +24,34 @@ interface MemosMemo {
   creator: string
   visibility: number
   tags: string[]
+}
+
+/** Memos v0.31.0 list 接口响应（grpc-gateway，camelCase） */
+interface MemosListResponse {
+  memos?: MemosMemo[]
+  nextPageToken?: string
+}
+
+/** 增量查重表条目：根块 + 标题块（①，标题供更新用） */
+interface ExistingEntry {
+  rootId: DbId
+  titleId: DbId | null
+}
+
+/** 引用标记：`> ` 可重复（`>> `），段首判定 */
+const QUOTE_LINE_RE = /^(?:>\s*)+/
+/**
+ * 行内引用切分（⑯）：Memos 正文里「他说： > 这句话」这种引用被软换行压平到同一段。
+ * 切点放在 `>` 本身，前方标点保留在文本段。
+ */
+const INLINE_QUOTE_RE = /[：:。；;，,、]\s*>+\s*/
+
+function stripQuotePrefix(s: string): string {
+  return s.replace(QUOTE_LINE_RE, "").trim()
+}
+
+function isQuoteLine(s: string): boolean {
+  return s.startsWith(">")
 }
 
 export async function load(_name: string) {
@@ -134,17 +171,39 @@ export async function unload() {
   console.log(`${pluginName} unloaded.`)
 }
 
+/**
+ * 同步入口（⑬ 并发闸门）：所有异常在此统一上报，避免"静默失败"。
+ */
 async function syncMemos(fullSync: boolean) {
+  if (syncing) {
+    orca.notify("warn", t("同步正在进行中，请稍候"))
+    return
+  }
+  syncing = true
+  try {
+    await syncMemosInner(fullSync)
+  } catch (err) {
+    console.error("MEMOS SYNC:", err)
+    orca.notify(
+      "error",
+      `${t("Failed to sync Memos notes.")} ${err instanceof Error ? err.message : String(err)}`,
+    )
+  } finally {
+    syncing = false
+  }
+}
+
+async function syncMemosInner(fullSync: boolean) {
   const settings = orca.state.plugins[pluginName]?.settings
   if (!settings) {
     orca.notify("error", t("Plugin settings not found."))
     return
   }
-  const memosApiUrl = settings.memosApiUrl
-  const memosApiToken = settings.memosApiToken
-  const inboxName = settings.inboxName || "Memos Inbox"
-  const noteTag = settings.noteTag || "Memos Note"
-  const startDateValue = settings.startDate
+  const memosApiUrl: string = settings.memosApiUrl
+  const memosApiToken: string = settings.memosApiToken
+  const inboxName: string = settings.inboxName || "Memos Inbox"
+  const noteTag: string = settings.noteTag || "Memos Note"
+  const startDateValue: string | null = settings.startDate
   const visibilityFilter: string[] = settings.visibilityFilter ?? [
     "PRIVATE",
     "PROTECTED",
@@ -156,104 +215,234 @@ async function syncMemos(fullSync: boolean) {
     return
   }
 
+  // ⑫ 可见性全不选 ≠ 不过滤：空数组时若直接往下走，会因"条件不成立"而同步全部可见性
+  //    （与设置项文案「未勾选的将被排除」相反，属隐私/范围失控）。
+  if (visibilityFilter.length === 0) {
+    orca.notify("warn", t("未选择任何可见性，已取消同步"))
+    return
+  }
+
   orca.notify("info", t("Starting to sync, please wait..."))
 
-  try {
-    let lastSyncTime: number | null = null
-    if (!fullSync) {
-      const saved = await orca.plugins.getData(pluginName, "lastSyncTime")
-      if (saved) lastSyncTime = saved
-    }
-
-    const memos = await fetchMemos(
-      memosApiUrl,
-      memosApiToken,
-      lastSyncTime,
-      startDateValue,
-      visibilityFilter,
-    )
-
-    if (!memos?.length) {
-      orca.notify("info", t("Nothing to sync."))
-      return
-    }
-
-    const memosByDate = groupBy<number, MemosMemo>(
-      (memo) => startOfDay(new Date(memo.createTime)).getTime(),
-      memos,
-    )
-
-    const totalMemos = memos.length
-    let syncedCount = 0
-
-    // 批量查询已存在的 Memos Note 块（用于删除或查重）
-    const allExistingIds = (await orca.invokeBackend("query", {
-      q: { kind: 1, conditions: [{ kind: 4, name: noteTag }] },
-      pageSize: 100000,
-    } as QueryDescription)) as DbId[]
-
-    let existingBlocks: Map<string, DbId>
-
-    if (fullSync) {
-      // 全量同步：先删除所有旧块（用完整 ID 列表，不因去重遗漏重复块）
-      if (allExistingIds?.length) {
-        orca.notify("info", t("Cleaning up old data before full sync..."))
-        for (let i = 0; i < allExistingIds.length; i += 100) {
-          try {
-            await orca.commands.invokeEditorCommand(
-              "core.editor.deleteBlocks", null, allExistingIds.slice(i, i + 100),
-            )
-          } catch (e) {
-            console.warn("MEMOS SYNC: Failed to delete batch", e)
-          }
-        }
-      }
-      // 全量同步不需要查重，所有 memo 都按新块创建
-      existingBlocks = new Map()
-    } else {
-      // 增量同步：构建 memoId → blockId 查重映射表
-      existingBlocks = new Map<string, DbId>()
-      if (allExistingIds?.length) {
-        const blocksData = await orca.invokeBackend("get-blocks", allExistingIds) as Block[]
-        if (blocksData) {
-          for (const b of blocksData) {
-            if (!b) continue
-            const idProp = b.properties?.find(p => p.name === "ID")
-            const memoId = (idProp?.value as string) || b.text
-            // Map 按 memoId 去重：只保留第一个遇到的块 ID（查重用就足够了）
-            if (memoId && !existingBlocks.has(memoId)) {
-              existingBlocks.set(memoId, b.id)
-            }
-          }
-        }
-      }
-    }
-
-    for (const [date, memosInDate] of memosByDate.entries()) {
-      const journal: Block = await orca.invokeBackend(
-        "get-journal-block",
-        new Date(date),
-      )
-      if (journal == null) continue
-      const inbox = await ensureInbox(journal, inboxName)
-
-      for (const memo of memosInDate) {
-        await syncMemo(memo, inbox, noteTag, memosApiUrl, existingBlocks)
-        syncedCount++
-        // 每 20 条通知一次进度
-        if (syncedCount % 20 === 0 || syncedCount === totalMemos) {
-          orca.notify("info", `Syncing... ${syncedCount}/${totalMemos}`)
-        }
-      }
-    }
-
-    await orca.plugins.setData(pluginName, "lastSyncTime", Date.now())
-
-    orca.notify("success", t("Memos notes synced successfully."))
-  } catch (err) {
-    console.error("MEMOS SYNC:", err)
-    orca.notify("error", t("Failed to sync Memos notes."))
+  let lastSyncTime: number | null = null
+  if (!fullSync) {
+    const saved = await orca.plugins.getData(pluginName, "lastSyncTime")
+    if (saved) lastSyncTime = saved
   }
+
+  const memos = await fetchMemos(
+    memosApiUrl,
+    memosApiToken,
+    lastSyncTime,
+    startDateValue,
+    visibilityFilter,
+  )
+
+  if (!memos?.length) {
+    orca.notify("info", t("Nothing to sync."))
+    return
+  }
+
+  const memosByDate = groupBy<number, MemosMemo>(
+    (memo) => startOfDay(new Date(memo.createTime)).getTime(),
+    memos,
+  )
+
+  const totalMemos = memos.length
+  let syncedCount = 0
+  let failedCount = 0
+  /** 本轮成功项里最大的 updateTime（毫秒），作为水位（②：不用本地时钟，避免漂移） */
+  let maxOkUpdatedMs = 0
+
+  const allExistingIds = await queryMemosNoteBlockIds(noteTag)
+
+  let existingBlocks: Map<string, ExistingEntry>
+
+  if (fullSync) {
+    // ⑰ 只删插件产物（同时具备 ID 属性的根块），避免误删用户手工打的同名标签块
+    const { ids: pluginRootIds, skipped } = await filterPluginRoots(allExistingIds)
+    if (pluginRootIds.length) {
+      orca.notify(
+        "info",
+        `清理旧数据：将删除 ${pluginRootIds.length} 块（已跳过 ${skipped} 块非插件块）`,
+      )
+      let deleteFailed = false
+      for (let i = 0; i < pluginRootIds.length; i += 100) {
+        try {
+          await orca.commands.invokeEditorCommand(
+            "core.editor.deleteBlocks",
+            null,
+            pluginRootIds.slice(i, i + 100),
+          )
+        } catch (e) {
+          console.error("MEMOS SYNC: 删除旧块失败", e)
+          deleteFailed = true
+          break // ③ 失败即中断，避免"半删 + 新建"产生重复块
+        }
+      }
+      if (deleteFailed) {
+        throw new Error(
+          `全量同步：删除旧块失败，已中断以避免产生重复块（已处理 ${pluginRootIds.length} 块中的一部分），请重试`,
+        )
+      }
+    }
+    existingBlocks = new Map()
+  } else {
+    existingBlocks = await buildExistingMap(allExistingIds)
+  }
+
+  for (const [date, memosInDate] of memosByDate.entries()) {
+    const journal: Block = await orca.invokeBackend(
+      "get-journal-block",
+      new Date(date),
+    )
+    if (journal == null) continue
+    const inbox = await ensureInbox(journal, inboxName)
+
+    for (const memo of memosInDate) {
+      const ok = await syncMemo(
+        memo,
+        inbox,
+        noteTag,
+        memosApiUrl,
+        existingBlocks,
+      )
+      if (ok) {
+        syncedCount++
+        const ms = Date.parse(memo.updateTime || memo.createTime)
+        if (!Number.isNaN(ms)) maxOkUpdatedMs = Math.max(maxOkUpdatedMs, ms)
+      } else {
+        failedCount++
+      }
+      const done = syncedCount + failedCount
+      if (done % 20 === 0 || done === totalMemos) {
+        orca.notify("info", `Syncing... ${done}/${totalMemos}`)
+      }
+    }
+  }
+
+  // ② 水位与失败处理：有失败则不推进（避免跳过失败项使其永不重试）
+  if (failedCount === 0) {
+    await orca.plugins.setData(
+      pluginName,
+      "lastSyncTime",
+      maxOkUpdatedMs || Date.now(),
+    )
+    await orca.plugins.setData(pluginName, FAIL_ROUNDS_KEY, 0)
+  } else {
+    // ⚠️ 注意：getData 首次返回 undefined，Number(undefined) = NaN，`?? 0` 不会兜住 NaN，
+    //    必须用 `|| 0`，否则 rounds 恒为 NaN，连续失败告警永不触发。
+    const prevRounds =
+      Number((await orca.plugins.getData(pluginName, FAIL_ROUNDS_KEY)) ?? 0) || 0
+    const rounds = prevRounds + 1
+    await orca.plugins.setData(pluginName, FAIL_ROUNDS_KEY, rounds)
+    if (rounds >= 3) {
+      // 连续失败不静默：明确告警，避免"水位永远不推进"变成无人发现的死锁
+      orca.notify(
+        "error",
+        `已连续 ${rounds} 轮同步存在失败（本轮 ${failedCount} 条），同步水位未推进。请检查网络/服务可达性，或单条 memo 的数据格式。`,
+      )
+    }
+  }
+
+  if (failedCount === 0) {
+    orca.notify("success", t("Memos notes synced successfully."))
+  } else {
+    orca.notify(
+      "warn",
+      `同步完成：成功 ${syncedCount} 条，失败 ${failedCount} 条（水位未推进，下次会重试）`,
+    )
+  }
+}
+
+/**
+ * ③ 查询插件的 Memos Note 块 ID。
+ * 注意：`invokeBackend("query")` 返回 `DbId[]`，**没有 pageToken**（那是 Memos HTTP 的机制）。
+ * 因此不照搬 HTTP 翻页：先用大 pageSize 一次取；只有命中上限才探测后端是否支持 `page`，
+ * 并用"返回同一页"来检测 page 参数被忽略，避免死循环。
+ */
+async function queryMemosNoteBlockIds(noteTag: string): Promise<DbId[]> {
+  const CAP = 100000
+  const baseQuery = {
+    q: { kind: 1, conditions: [{ kind: 4, name: noteTag }] },
+    pageSize: CAP,
+  } as QueryDescription
+
+  const ids = ((await orca.invokeBackend("query", baseQuery)) ?? []) as DbId[]
+  if (ids.length < CAP) return ids
+
+  orca.notify(
+    "warn",
+    `查询命中上限 ${CAP}，可能被截断，正在尝试分页取全…`,
+  )
+  const out: DbId[] = []
+  const seen = new Set<DbId>()
+  for (let page = 1; page <= 500; page++) {
+    const chunk = ((await orca.invokeBackend("query", {
+      ...(baseQuery as object),
+      pageSize: 1000,
+      page,
+    } as QueryDescription)) ?? []) as DbId[]
+    if (!chunk.length) break
+    const before = out.length
+    for (const id of chunk) {
+      if (!seen.has(id)) {
+        seen.add(id)
+        out.push(id)
+      }
+    }
+    if (out.length === before) break // page 被忽略（返回同一页）→ 停止，避免死循环
+    if (chunk.length < 1000) break
+  }
+  if (out.length <= ids.length) {
+    orca.notify("warn", "分页未生效，查询结果仍可能被截断，请留意是否有孤儿块。")
+    return ids
+  }
+  return out
+}
+
+/** ⑰ 过滤出插件产物（带 ID 属性的根块）；其余计入 skipped 并告知用户 */
+async function filterPluginRoots(
+  allIds: DbId[],
+): Promise<{ ids: DbId[]; skipped: number }> {
+  if (!allIds?.length) return { ids: [], skipped: 0 }
+  const blocks = ((await orca.invokeBackend("get-blocks", allIds)) ??
+    []) as Block[]
+  const ids: DbId[] = []
+  let skipped = 0
+  for (const b of blocks) {
+    if (!b) continue
+    if (b.properties?.some((p) => p.name === "ID")) ids.push(b.id)
+    else skipped++
+  }
+  return { ids, skipped }
+}
+
+/**
+ * ⑥ 构建增量查重表：只认 `ID` 属性，不再用 `b.text` 兜底（文本兜底会误判）。
+ * 无 ID 属性的块（手工创建/旧版导入）跳过并留痕，不混入查重。
+ * ① 同时记录标题块：不变式 = `root.children[0]` 恒为标题块
+ *    （创建顺序：根 → 标题 → 正文 → 链接块；正文是标题的子块）。
+ */
+async function buildExistingMap(
+  allIds: DbId[],
+): Promise<Map<string, ExistingEntry>> {
+  const map = new Map<string, ExistingEntry>()
+  if (!allIds?.length) return map
+  const blocks = ((await orca.invokeBackend("get-blocks", allIds)) ??
+    []) as Block[]
+  for (const b of blocks) {
+    if (!b) continue
+    const idProp = b.properties?.find((p) => p.name === "ID")
+    if (!idProp?.value) {
+      console.warn("MEMOS SYNC: 跳过无 ID 属性的块", b.id)
+      continue
+    }
+    const memoId = String(idProp.value).trim()
+    if (!memoId || map.has(memoId)) continue
+    map.set(memoId, { rootId: b.id, titleId: b.children?.[0] ?? null })
+  }
+  return map
 }
 
 async function fetchMemos(
@@ -287,10 +476,7 @@ async function fetchMemos(
     const lastSyncTs = Math.floor(lastSyncTime / 1000)
     filters.push(`updated_ts >= timestamp(${lastSyncTs})`)
   }
-  if (
-    visibilityFilter?.length > 0 &&
-    visibilityFilter.length < 3
-  ) {
+  if (visibilityFilter.length > 0 && visibilityFilter.length < 3) {
     const visList = visibilityFilter.map((v) => `"${v}"`).join(", ")
     filters.push(`visibility in [${visList}]`)
   }
@@ -318,75 +504,120 @@ async function fetchMemos(
   return allMemos
 }
 
-function xhrRequest(url: string, token: string): Promise<any> {
+/** ⑤ 带超时 + 按状态码分类报错（401/403/400/429/网络不可达 各自可定位） */
+async function xhrRequest(
+  url: string,
+  token: string,
+): Promise<MemosListResponse> {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest()
     xhr.open("GET", url, true)
+    xhr.timeout = 30000
     xhr.setRequestHeader("Authorization", `Bearer ${token}`)
     xhr.setRequestHeader("Content-Type", "application/json")
     xhr.setRequestHeader("Accept", "application/json")
     xhr.onreadystatechange = () => {
-      if (xhr.readyState === 4) {
-        if (xhr.status >= 200 && xhr.status < 300) {
-          try {
-            resolve(JSON.parse(xhr.responseText))
-          } catch (e) {
-            reject(new Error(`Failed to parse JSON: ${(xhr.responseText || "").substring(0, 200)}`))
-          }
-        } else {
-          reject(new Error(`HTTP ${xhr.status}: ${xhr.statusText}. Response: ${(xhr.responseText || "").substring(0, 200)}`))
+      if (xhr.readyState !== 4) return
+      const body = (xhr.responseText || "").substring(0, 200)
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try {
+          resolve(JSON.parse(xhr.responseText) as MemosListResponse)
+        } catch (e) {
+          reject(new Error(`响应不是合法 JSON：${body}`))
         }
+        return
+      }
+      switch (xhr.status) {
+        case 0:
+          reject(new Error("网络不可达：请检查 API 地址 / 代理 / 证书"))
+          return
+        case 400:
+          reject(new Error(`请求参数错误（filter 语法）：${body}`))
+          return
+        case 401:
+          reject(new Error("API Token 无效或已过期（401）"))
+          return
+        case 403:
+          reject(new Error("无权限访问该资源（403）"))
+          return
+        case 429:
+          reject(new Error("请求过于频繁（429），请稍后重试"))
+          return
+        default:
+          reject(new Error(`HTTP ${xhr.status}: ${xhr.statusText}。${body}`))
       }
     }
-    xhr.onerror = () => {
-      reject(new Error(`Network error. Response: ${(xhr.responseText || "").substring(0, 200)}`))
-    }
+    xhr.ontimeout = () =>
+      reject(new Error("请求超时（30s）：请检查 Memos 服务是否可达"))
+    xhr.onerror = () =>
+      reject(new Error("网络不可达：请检查 API 地址 / 代理 / 证书"))
     xhr.send()
   })
 }
 
+/** 解析 memo：标题（首段，剥引用前缀）+ 正文段落 */
+function parseMemosContent(
+  memo: MemosMemo,
+  memoId: string,
+): { titleText: string; bodyParas: string[] } {
+  let cleanContent = memo.content ?? ""
+  if (memo.tags?.length) {
+    const escapedTags = memo.tags.map((tag) =>
+      tag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
+    )
+    const tagPattern = new RegExp(`#(?:${escapedTags.join("|")})\\s*`, "g")
+    cleanContent = cleanContent.replace(tagPattern, "").trim()
+  }
+  const paragraphs = cleanContent.split("\n").filter((p) => p.trim())
+  const first = paragraphs[0] ?? memoId
+  // 首行若是引用（`> ` 开头），剥掉前缀，避免标题带上引号符号
+  const titleText = stripQuotePrefix(first).substring(0, 100)
+  const bodyParas = paragraphs.slice(1).filter((p) => p.trim())
+  return { titleText, bodyParas }
+}
+
+/**
+ * 单条 memo：命中则更新（①），否则新建。返回是否成功（②：不再静默吞错）。
+ */
 async function syncMemo(
   memo: MemosMemo,
   inbox: Block,
   noteTag: string,
   memosApiUrl: string,
-  existingBlocks: Map<string, DbId>,
-) {
+  existingBlocks: Map<string, ExistingEntry>,
+): Promise<boolean> {
   try {
-    const memoId = memo.name.replace("memos/", "")
-
-    // 查重：从批量查询的 Map 中 O(1) 查找（替代逐条 API 查询）
-    if (existingBlocks.has(memoId)) {
-      return
+    // ④ 严格解析 memoId：只认 `memos/<id>`，异常格式直接判失败，不污染查重/ID 属性
+    const memoId = /^memos\/(.+)$/.exec(memo.name ?? "")?.[1]?.trim() ?? ""
+    if (!memoId) {
+      console.warn("MEMOS SYNC: 非法的 memo.name", memo.name)
+      return false
     }
 
-    // 2. 准备内容：去标签文本
-    let cleanContent = memo.content
-    if (memo.tags?.length) {
-      const escapedTags = memo.tags.map((tag) =>
-        tag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
-      )
-      const tagPattern = new RegExp(`#(?:${escapedTags.join("|")})\\s*`, "g")
-      cleanContent = cleanContent.replace(tagPattern, "").trim()
+    // ① 命中已有块 → 原地更新（标题 + 标签 + 正文），而不是直接跳过
+    const hit = existingBlocks.get(memoId)
+    if (hit) {
+      return await updateMemo(memo, memoId, hit)
     }
 
-    // 提取标题（第2层用）：第一行/首句，最多100字符
-    // 若首行是引用（以 "> " 开头），剥掉前缀，避免标题带上引号符号
-    const paragraphs = cleanContent.split("\n").filter((p) => p.trim())
-    const titleText = (paragraphs[0] || memoId).replace(/^>\s?/, "").substring(0, 100)
-    const bodyParas = paragraphs.slice(1).filter((p) => p.trim())
+    const { titleText, bodyParas } = parseMemosContent(memo, memoId)
 
     // ===== 第1层：根块（纯 ID 文本，不含 # 以免被 Orca 当作标签引用解析） =====
     const rootId = await orca.commands.invokeEditorCommand(
-      "core.editor.insertBlock", null as any, inbox, "lastChild",
+      "core.editor.insertBlock",
+      null,
+      inbox,
+      "lastChild",
       [{ t: "t", v: memoId }],
     )
     let noteBlock = orca.state.blocks[rootId] ?? null
-    if (!noteBlock) return
+    if (!noteBlock) return false
 
     // 在根块上存一份 ID 属性（供批量查重使用，get-blocks 可读取）
     await orca.commands.invokeEditorCommand(
-      "core.editor.setProperties", null, [rootId],
+      "core.editor.setProperties",
+      null,
+      [rootId],
       [{ name: "ID", type: 1, value: memoId }],
     )
 
@@ -407,7 +638,7 @@ async function syncMemo(
       "lastChild",
       [{ t: "t", v: titleText }],
     )
-    if (!titleId) return
+    if (!titleId) return false
 
     // Memos 原始标签打在标题块上
     if (memo.tags?.length) {
@@ -422,84 +653,9 @@ async function syncMemo(
     }
 
     // ===== 第3层：内容块（标题块的子块） =====
-    // 识别 Memos 的引用语法 "> ..."，剥掉前缀并渲染成 Orca 引用块。
-    //
-    // ⚠️ 关键：Orca 的 quote2 是「容器块」——它只渲染自己的**子块**，不渲染内联
-    // content。原生引用块的真实形态是 content=NULL + 一个子 text 块（库内 112/149
-    // 个 quote2 均如此）。若把正文直接作为 content 塞进 quote2，界面会显示成带
-    // 「引述」占位符的空引用块（v1.1.0 的线上 bug）。
-    // 因此这里先建一个空的 quote2 容器，再把正文作为 text 子块插进去。
-    if (bodyParas.length > 0) {
-      const titleBlock = orca.state.blocks[titleId]
-      if (titleBlock) {
-        const QUOTE_RE = /^>\s?/
-        let prevContentId: DbId | null = null
-        let i = 0
-        while (i < bodyParas.length) {
-          const para = bodyParas[i].trim()
-          const isQuote = QUOTE_RE.test(para)
-          let text: string
-          if (isQuote) {
-            // 合并连续的引用行，避免拆成多个独立引用块
-            const lines: string[] = []
-            while (i < bodyParas.length && QUOTE_RE.test(bodyParas[i].trim())) {
-              lines.push(bodyParas[i].trim().replace(QUOTE_RE, ""))
-              i++
-            }
-            text = lines.join("\n")
-          } else {
-            text = para
-            i++
-          }
-          // 剥掉 "> " 后可能为空（如单独一行 ">"），跳过
-          if (!text.trim()) continue
-
-          const anchor = prevContentId
-            ? orca.state.blocks[prevContentId]
-            : titleBlock
-          const position = prevContentId ? "after" : "firstChild"
-
-          if (isQuote) {
-            // 1) 建空的 quote2 容器（content 必须传 null）
-            const quoteId = await orca.commands.invokeEditorCommand(
-              "core.editor.insertBlock",
-              null,
-              anchor,
-              position,
-              null,
-              { type: "quote2" },
-            )
-            if (!quoteId) continue
-            // 2) 正文作为 text 子块放进容器内（quote2 渲染的正是子块）
-            const quoteBlock = orca.state.blocks[quoteId]
-            if (quoteBlock) {
-              await orca.commands.invokeEditorCommand(
-                "core.editor.insertBlock",
-                null,
-                quoteBlock,
-                "lastChild",
-                [{ t: "t", v: text }],
-                { type: "text" },
-              )
-            }
-            prevContentId = quoteId
-          } else {
-            const paraId = await orca.commands.invokeEditorCommand(
-              "core.editor.insertBlock",
-              null,
-              anchor,
-              position,
-              [{ t: "t", v: text }],
-              { type: "text" },
-            )
-            if (paraId) prevContentId = paraId
-          }
-        }
-      }
-    }
+    await writeBody(titleId, bodyParas)
 
     // ===== 第4层：链接块（最后，溯源用） =====
-    // 重新获取根块（title 插入后 children 已变，旧引用 stale）
     noteBlock = orca.state.blocks[rootId] ?? noteBlock
     // v0.31.0 网页路由为 /memos/{uid}（navigation.ts: directMemoPrefix = "/memos/"），
     // 旧路由 /m/{uid} 在新实例中会 404，故改为 /memos/。
@@ -512,7 +668,236 @@ async function syncMemo(
       // t:"l" = 内联链接片段，v=显示文本，l=跳转URL
       [{ t: "l", v: "🔗 Open in Memos", l: memoUrl }],
     )
+
+    return true
   } catch (e) {
     console.error("MEMOS SYNC: syncMemo error for", memo.name, e)
+    return false
   }
+}
+
+/**
+ * ① 更新已有 memo：标题文本 + 标签差分 + 正文重建（根块与 ID 属性保持不变）。
+ */
+async function updateMemo(
+  memo: MemosMemo,
+  memoId: string,
+  entry: ExistingEntry,
+): Promise<boolean> {
+  const titleId =
+    entry.titleId ?? orca.state.blocks[entry.rootId]?.children?.[0] ?? null
+  if (!titleId) {
+    console.warn("MEMOS SYNC: 找不到标题块，跳过更新", memoId)
+    return false
+  }
+
+  let titleBlock = orca.state.blocks[titleId]
+  if (!titleBlock) {
+    const fetched = ((await orca.invokeBackend("get-blocks", [titleId])) ??
+      []) as Block[]
+    titleBlock = fetched?.[0]
+  }
+  if (!titleBlock) {
+    console.warn("MEMOS SYNC: 标题块不存在，跳过更新", titleId)
+    return false
+  }
+
+  const { titleText, bodyParas } = parseMemosContent(memo, memoId)
+
+  // 标题：core.editor.setBlocksContent（setContent / setBlock 在 Orca 中不存在）
+  await orca.commands.invokeEditorCommand(
+    "core.editor.setBlocksContent",
+    null,
+    [{ id: titleId, content: [{ t: "t", v: titleText }] }],
+  )
+
+  // 标签差分
+  await syncTags(titleId, titleBlock, memo.tags ?? [])
+
+  // 正文：先删旧子块再重建（writeBody 内部负责）
+  await writeBody(titleId, bodyParas)
+
+  return true
+}
+
+/** ① 标签差分：读当前标签名（`_tags` 属性 → ref → 标签块文本），与目标集合比对 */
+async function syncTags(
+  titleId: DbId,
+  titleBlock: Block,
+  desired: string[],
+): Promise<void> {
+  const wanted = desired
+    .filter(Boolean)
+    .map((s) => s.trim())
+    .filter(Boolean)
+
+  // `_tags` 在 DB 中是「同名多行、每行一个 ref id」的形态，不是 JSON 数组
+  const tagRefIds = new Set(
+    (titleBlock.properties ?? [])
+      .filter((p) => p.name === "_tags")
+      .map((p) => Number(p.value)),
+  )
+  const tagBlockIds = (titleBlock.refs ?? [])
+    .filter((r) => tagRefIds.has(r.id))
+    .map((r) => r.to)
+
+  const current = new Set<string>()
+  if (tagBlockIds.length) {
+    const tagBlocks = ((await orca.invokeBackend(
+      "get-blocks",
+      tagBlockIds,
+    )) ?? []) as Block[]
+    for (const b of tagBlocks) {
+      if (b?.text) current.add(b.text.trim())
+    }
+  }
+
+  for (const name of wanted) {
+    if (current.has(name)) continue
+    try {
+      await orca.commands.invokeEditorCommand(
+        "core.editor.insertTag",
+        null,
+        titleId,
+        name,
+      )
+    } catch (e) {
+      console.warn("MEMOS SYNC: insertTag 失败", name, e)
+    }
+  }
+  for (const name of current) {
+    if (wanted.includes(name)) continue
+    try {
+      // removeTag 签名（据注册体）：(cursor, blockId, tagName)
+      await orca.commands.invokeEditorCommand(
+        "core.editor.removeTag",
+        null,
+        titleId,
+        name,
+      )
+    } catch (e) {
+      console.warn("MEMOS SYNC: removeTag 失败", name, e)
+    }
+  }
+}
+
+/**
+ * 正文写入（①⑮⑯ 三路径共用）。
+ * - 若标题块已有子块（更新路径），先整体删除再重建。
+ * - `quote2` 是**容器块**：只渲染子块、不渲染内联 content → 必须「空容器 + text 子块」。
+ * - ⑮ 连续引用行 → 同一个容器内**每行一个子块**（与 Orca 原生多段引用一致）。
+ * - ⑯ 行内 `> 引文` → 拆成文本块 + 引用块，避免残留字面 `>`。
+ */
+async function writeBody(titleId: DbId, bodyParas: string[]) {
+  const titleBlock = orca.state.blocks[titleId]
+  if (!titleBlock) return
+
+  const oldChildren = titleBlock.children ?? []
+  if (oldChildren.length) {
+    await orca.commands.invokeEditorCommand(
+      "core.editor.deleteBlocks",
+      null,
+      oldChildren,
+    )
+  }
+
+  // 1) 摊平成片段序列
+  const segments: Array<{ quote: boolean; text: string }> = []
+  for (const raw of bodyParas) {
+    const para = raw.trim()
+    if (!para) continue
+    if (isQuoteLine(para)) {
+      segments.push({ quote: true, text: stripQuotePrefix(para) })
+      continue
+    }
+    for (const seg of splitInlineQuotes(para)) segments.push(seg)
+  }
+
+  // 2) 写入：连续 quote 片段合并为同一个容器
+  let prev: DbId | null = null
+  let i = 0
+  while (i < segments.length) {
+    const seg = segments[i]
+    const anchor = prev
+      ? orca.state.blocks[prev] ?? orca.state.blocks[titleId]
+      : orca.state.blocks[titleId]
+    const position = prev ? "after" : "firstChild"
+    if (!anchor) break
+
+    if (!seg.quote) {
+      const text = seg.text.trim()
+      i++
+      if (!text) continue
+      const id = await orca.commands.invokeEditorCommand(
+        "core.editor.insertBlock",
+        null,
+        anchor,
+        position,
+        [{ t: "t", v: text }],
+        { type: "text" },
+      )
+      if (id) prev = id
+      continue
+    }
+
+    // 连续引用片段 → 一个空 quote2 容器
+    const lines: string[] = []
+    while (i < segments.length && segments[i].quote) {
+      const text = segments[i].text.trim()
+      if (text) lines.push(text)
+      i++
+    }
+    if (!lines.length) continue
+
+    const quoteId = await orca.commands.invokeEditorCommand(
+      "core.editor.insertBlock",
+      null,
+      anchor,
+      position,
+      null, // 容器 content 必须为 null
+      { type: "quote2" },
+    )
+    if (!quoteId) continue
+    const quoteBlock = orca.state.blocks[quoteId]
+    if (quoteBlock) {
+      for (const line of lines) {
+        await orca.commands.invokeEditorCommand(
+          "core.editor.insertBlock",
+          null,
+          quoteBlock,
+          "lastChild",
+          [{ t: "t", v: line }],
+          { type: "text" },
+        )
+      }
+    }
+    prev = quoteId
+  }
+}
+
+/**
+ * ⑯ 把一段文字按「标点 + `>`」切成 文本/引用 片段。
+ * 说明：扁平化后的段落里，引用之后的叙述文字无法与引用本身区分，
+ * 因此按「引用持续到下一个 `>` 之前」处理（保真但不精确；完整语义由 M4 方案 B 解决）。
+ */
+function splitInlineQuotes(para: string): Array<{
+  quote: boolean
+  text: string
+}> {
+  const out: Array<{ quote: boolean; text: string }> = []
+  let rest = para
+  let quoteMode = false
+
+  while (true) {
+    const m = INLINE_QUOTE_RE.exec(rest)
+    if (!m) break
+    const gt = m.index + m[0].lastIndexOf(">")
+    const head = rest.slice(0, gt).trim()
+    if (head) out.push({ quote: quoteMode, text: head })
+    rest = rest.slice(gt + 1).trim()
+    quoteMode = true
+    if (!INLINE_QUOTE_RE.test(rest)) break
+  }
+  if (rest.trim()) out.push({ quote: quoteMode, text: rest.trim() })
+  return out.length ? out : [{ quote: false, text: para }]
 }
