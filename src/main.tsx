@@ -210,61 +210,86 @@ async function probeRuntime() {
   try {
     const O = orca as unknown as Record<string, any>
     const state: Record<string, any> = O.state ?? {}
-    const rawPanels: any = state.panels ?? {}
-    const ids: string[] = Array.isArray(rawPanels)
-      ? rawPanels.map((_: any, i: number) => String(i))
-      : Object.keys(rawPanels)
-    const panels: Record<string, any> = rawPanels
+    const panelsNode: any = state.panels
     const keysOf = (o: any): string[] =>
       o && typeof o === "object" ? Object.keys(o) : []
 
-    let findByFirstId = "n/a"
-    let findByUndefined = "n/a"
-    const navType = typeof O.nav?.findViewPanel
-    try {
-      if (ids.length) {
-        const r = O.nav.findViewPanel(ids[0], panels)
-        findByFirstId = r ? `ok: ${keysOf(r).slice(0, 8).join(" | ")}` : "undefined"
+    // orca.state.panels 是「布局树」：内部节点 {id,direction,children,height}，
+    // 叶子是字符串 = 真实 panelId。v1 误当成 map，取到的是节点字段名。
+    const collectPanelIds = (node: any, out: string[], depth = 0): string[] => {
+      if (node == null || depth > 30) return out
+      if (typeof node === "string") {
+        out.push(node)
+        return out
       }
-      const r2 = O.nav.findViewPanel(undefined, panels)
-      findByUndefined = r2 ? "返回非空（可用 undefined）" : "undefined（不可用）"
-    } catch (e) {
-      findByFirstId = `throw: ${e instanceof Error ? e.message : String(e)}`
+      if (Array.isArray(node)) {
+        for (const c of node) collectPanelIds(c, out, depth + 1)
+        return out
+      }
+      if (typeof node === "object" && Array.isArray(node.children)) {
+        for (const c of node.children) collectPanelIds(c, out, depth + 1)
+      }
+      return out
+    }
+
+    const layoutIds = Array.from(new Set(collectPanelIds(panelsNode, [])))
+    const activePanel: string | null =
+      typeof state.activePanel === "string" ? state.activePanel : null
+
+    const inspect = (pid: string) => {
+      const rec: Record<string, any> = { panelId: pid }
+      try {
+        rec.isViewPanel = typeof O.nav?.isViewPanel === "function" ? O.nav.isViewPanel(pid) : "n/a"
+      } catch (e) {
+        rec.isViewPanel = `throw: ${e instanceof Error ? e.message : String(e)}`
+      }
+      try {
+        const vp = O.nav?.findViewPanel?.(pid, panelsNode)
+        rec.found = Boolean(vp)
+        if (vp) {
+          rec.viewPanelKeys = keysOf(vp).slice(0, 20)
+          rec.viewStateKeys = keysOf(vp.viewState).slice(0, 30)
+          rec.editorKeys = keysOf(vp.viewState?.editor).slice(0, 30)
+          rec.hasEditor = Boolean(vp.viewState?.editor)
+          rec.editorKind =
+            typeof vp.viewState?.editor === "object"
+              ? "object"
+              : typeof vp.viewState?.editor
+        }
+      } catch (e) {
+        rec.found = `throw: ${e instanceof Error ? e.message : String(e)}`
+      }
+      return rec
     }
 
     const snapshot = {
-      panelCount: ids.length,
-      panelIds: ids.slice(0, 12),
-      activeCandidates: {
-        activePanelId: state.activePanelId ?? null,
-        activePanel: typeof state.activePanel === "object"
-          ? keysOf(state.activePanel).slice(0, 6).join(" | ")
-          : state.activePanel ?? null,
-        selectedPanelId: state.selectedPanelId ?? null,
-        activeViewId: state.activeViewId ?? null,
-        activeRootBlockId: state.activeRootBlockId ?? null,
+      panelsShape: {
+        type: typeof panelsNode,
+        isArray: Array.isArray(panelsNode),
+        keys: keysOf(panelsNode),
+        direction: panelsNode?.direction ?? null,
+        childCount: Array.isArray(panelsNode?.children)
+          ? panelsNode.children.length
+          : null,
       },
+      layoutPanelIds: layoutIds,
+      activePanel,
+      activePanelInLayout: activePanel ? layoutIds.includes(activePanel) : null,
+      inspections: [
+        ...(activePanel ? [inspect(activePanel)] : []),
+        ...layoutIds
+          .filter((id) => id !== activePanel)
+          .slice(0, 3)
+          .map(inspect),
+      ],
+      navKeys: keysOf(O.nav).slice(0, 40),
       stateKeysMatching: keysOf(state).filter((k) =>
         /panel|view|editor|cursor|focus|active/i.test(k),
       ),
-      navKeys: keysOf(O.nav).slice(0, 40),
-      findViewPanel: {
-        type: navType,
-        byFirstId: findByFirstId,
-        byUndefined: findByUndefined,
-      },
-      firstPanel: ids.length
-        ? {
-            id: ids[0],
-            keys: keysOf(panels[ids[0]]),
-            viewStateKeys: keysOf(panels[ids[0]]?.viewState),
-            viewStateEditorKeys: keysOf(panels[ids[0]]?.viewState?.editor).slice(0, 20),
-          }
-        : null,
     }
 
     const json = JSON.stringify(snapshot, null, 2)
-    console.log("MEMOS SYNC: 运行态探测结果\n" + json)
+    console.log("MEMOS SYNC: 运行态探测结果 v2\n" + json)
 
     let copied = false
     try {
@@ -273,9 +298,12 @@ async function probeRuntime() {
     } catch (e) {
       console.warn("MEMOS SYNC: 写剪贴板失败", e)
     }
+    const first = snapshot.inspections[0]
     orca.notify(
       "success",
-      `探测完成：${ids.length} 个面板，findViewPanel=${findByFirstId}；结果已${copied ? "复制到剪贴板" : "打印到控制台"}`,
+      `探测 v2：${layoutIds.length} 个面板，activePanel=${activePanel ?? "null"}；` +
+        `findViewPanel=${first?.found ? "ok" : String(first?.found)}，hasEditor=${first?.hasEditor ?? "?"}；` +
+        `结果已${copied ? "复制到剪贴板" : "打印到控制台"}`,
     )
   } catch (e) {
     console.error("MEMOS SYNC: probe error", e)
