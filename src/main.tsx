@@ -125,6 +125,17 @@ export async function load(_name: string) {
     )
   }
 
+  // 【临时】运行态探测：为 ⑪-B（batchInsertHTML 需要真实 panelId）取证，验证后删除
+  if (orca.state.commands["memos.probe"] == null) {
+    orca.commands.registerCommand(
+      "memos.probe",
+      async () => {
+        await probeRuntime()
+      },
+      t("探测 Orca 运行态（临时）"),
+    )
+  }
+
   if (orca.state.headbarButtons["memos.sync"] == null) {
     orca.headbar.registerHeadbarButton("memos.sync", () => (
       <HoverContextMenu
@@ -151,6 +162,13 @@ export async function load(_name: string) {
                 await orca.commands.invokeCommand("memos.cleanup")
               }}
             />
+            <MenuText
+              title={t("探测 Orca 运行态（临时）")}
+              onClick={async () => {
+                closeMenu()
+                await orca.commands.invokeCommand("memos.probe")
+              }}
+            />
           </>
         )}
       >
@@ -171,6 +189,7 @@ export async function unload() {
   orca.headbar.unregisterHeadbarButton("memos.sync")
   orca.commands.unregisterCommand("memos.sync")
   orca.commands.unregisterCommand("memos.cleanup")
+  orca.commands.unregisterCommand("memos.probe")
   orca.themes.removeCSS(pluginName)
 
   console.log(`${pluginName} unloaded.`)
@@ -179,6 +198,94 @@ export async function unload() {
 /**
  * 同步入口（⑬ 并发闸门）：所有异常在此统一上报，避免"静默失败"。
  */
+/**
+ * 【临时诊断】探测 Orca 运行态：确认能否拿到可用的 panelId。
+ *
+ * 背景：`core.editor.batchInsertHTML` 内部会 `orca.nav.findViewPanel(panelId)` 然后
+ * 直接访问 `.viewState`；插件侧若拿不到真实 panelId，这条路就走不通（见方案 §12）。
+ * 本命令**只读**：不写库、不改任何块，结果打印到控制台并复制到剪贴板。
+ * 采集完（确认字段名）后应删除本命令与对应菜单项。
+ */
+async function probeRuntime() {
+  try {
+    const O = orca as unknown as Record<string, any>
+    const state: Record<string, any> = O.state ?? {}
+    const rawPanels: any = state.panels ?? {}
+    const ids: string[] = Array.isArray(rawPanels)
+      ? rawPanels.map((_: any, i: number) => String(i))
+      : Object.keys(rawPanels)
+    const panels: Record<string, any> = rawPanels
+    const keysOf = (o: any): string[] =>
+      o && typeof o === "object" ? Object.keys(o) : []
+
+    let findByFirstId = "n/a"
+    let findByUndefined = "n/a"
+    const navType = typeof O.nav?.findViewPanel
+    try {
+      if (ids.length) {
+        const r = O.nav.findViewPanel(ids[0], panels)
+        findByFirstId = r ? `ok: ${keysOf(r).slice(0, 8).join(" | ")}` : "undefined"
+      }
+      const r2 = O.nav.findViewPanel(undefined, panels)
+      findByUndefined = r2 ? "返回非空（可用 undefined）" : "undefined（不可用）"
+    } catch (e) {
+      findByFirstId = `throw: ${e instanceof Error ? e.message : String(e)}`
+    }
+
+    const snapshot = {
+      panelCount: ids.length,
+      panelIds: ids.slice(0, 12),
+      activeCandidates: {
+        activePanelId: state.activePanelId ?? null,
+        activePanel: typeof state.activePanel === "object"
+          ? keysOf(state.activePanel).slice(0, 6).join(" | ")
+          : state.activePanel ?? null,
+        selectedPanelId: state.selectedPanelId ?? null,
+        activeViewId: state.activeViewId ?? null,
+        activeRootBlockId: state.activeRootBlockId ?? null,
+      },
+      stateKeysMatching: keysOf(state).filter((k) =>
+        /panel|view|editor|cursor|focus|active/i.test(k),
+      ),
+      navKeys: keysOf(O.nav).slice(0, 40),
+      findViewPanel: {
+        type: navType,
+        byFirstId: findByFirstId,
+        byUndefined: findByUndefined,
+      },
+      firstPanel: ids.length
+        ? {
+            id: ids[0],
+            keys: keysOf(panels[ids[0]]),
+            viewStateKeys: keysOf(panels[ids[0]]?.viewState),
+            viewStateEditorKeys: keysOf(panels[ids[0]]?.viewState?.editor).slice(0, 20),
+          }
+        : null,
+    }
+
+    const json = JSON.stringify(snapshot, null, 2)
+    console.log("MEMOS SYNC: 运行态探测结果\n" + json)
+
+    let copied = false
+    try {
+      await navigator.clipboard.writeText(json)
+      copied = true
+    } catch (e) {
+      console.warn("MEMOS SYNC: 写剪贴板失败", e)
+    }
+    orca.notify(
+      "success",
+      `探测完成：${ids.length} 个面板，findViewPanel=${findByFirstId}；结果已${copied ? "复制到剪贴板" : "打印到控制台"}`,
+    )
+  } catch (e) {
+    console.error("MEMOS SYNC: probe error", e)
+    orca.notify(
+      "error",
+      `探测失败：${e instanceof Error ? e.message : String(e)}`,
+    )
+  }
+}
+
 async function syncMemos(fullSync: boolean) {
   if (syncing) {
     orca.notify("warn", t("同步正在进行中，请稍候"))
