@@ -31,11 +31,16 @@ interface MemosMemo {
   createTime: string
   updateTime: string
   creator: string
-  visibility: number
+  visibility: string | number // 26.x 返回字符串枚举("PUBLIC"/"PROTECTED"/"PRIVATE")；v0.31 为数字。未用于逻辑，仅为类型准确。
   tags: string[]
 }
 
-/** Memos v0.31.0 list 接口响应（grpc-gateway，camelCase） */
+/**
+ * Memos list 接口响应。
+ * ⚠️ 26.x 兼容性：路径由 `/api/v1/memos` 改为 `/api/memos`（v1 前缀已移除）；
+ * `visibility` 在 26.x 为字符串枚举，v0.31 为数字；
+ * `name`/`content`/`createTime`/`updateTime`/`tags` 字段名保持兼容。
+ */
 interface MemosListResponse {
   memos?: MemosMemo[]
   nextPageToken?: string
@@ -539,7 +544,7 @@ async function fetchAllMemoIds(
   token: string,
 ): Promise<Set<string>> {
   const baseUrl = apiUrl.replace(/\/$/, "")
-  const url = new URL(`${baseUrl}/api/v1/memos`)
+  const url = new URL(`${baseUrl}/api/memos`)
   url.searchParams.set("pageSize", "100")
   const ids = new Set<string>()
   let pageToken: string | undefined
@@ -570,8 +575,8 @@ async function fetchMemos(
   visibilityFilter: string[],
 ): Promise<MemosMemo[]> {
   const baseUrl = apiUrl.replace(/\/$/, "")
-  const url = new URL(`${baseUrl}/api/v1/memos`)
-  // v0.31.0 的 grpc-gateway 按 json_name（camelCase）匹配 query key，
+  const url = new URL(`${baseUrl}/api/memos`)
+  // memos 的 grpc-gateway 按 json_name（camelCase）匹配 query key，
   // 实测 page_size / order_by 在本实例也能工作，但 camelCase 是规范写法、对其他实例更稳。
   url.searchParams.set("pageSize", "100")
   url.searchParams.set("orderBy", "create_time desc")
